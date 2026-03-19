@@ -1,15 +1,18 @@
 // active-membership-server.ts
 // Express server + Stagehand v3 browser automation
 //
-// ╔══════════════════════════════════════════════════════════════╗
-// ║  STAGEHAND v3 API — key differences from v2                 ║
-// ║  ✅  stagehand.act(...)         ← AI actions on V3 instance ║
-// ║  ✅  stagehand.context          ← CDP-backed V3Context      ║
-// ║  ✅  stagehand.context          ║
-// ║       .activePage()!            ← get the live Page         ║
-// ║  ❌  stagehand.page             ← does NOT exist in v3      ║
-// ║  ❌  page.act(...)              ← does NOT exist on Page    ║
-// ╚══════════════════════════════════════════════════════════════╝
+// ╔══════════════════════════════════════════════════════════════════╗
+// ║  ROOT CAUSE OF PREVIOUS ERRORS                                  ║
+// ║                                                                  ║
+// ║  stagehand.act() asks Gemini to find an element by returning    ║
+// ║  an elementId. When Gemini can't find the element (e.g. a       ║
+// ║  button inside a modal/shadow-DOM), it returns elementId: ""    ║
+// ║  which fails Stagehand's Zod schema → AI_NoObjectGeneratedError ║
+// ║                                                                  ║
+// ║  FIX: Use page.locator(selector).click() / .fill() for ALL      ║
+// ║  interactions — pure CDP, zero AI calls, zero schema failures.  ║
+// ║  stagehand.act() is NOT used anywhere in this file.             ║
+// ╚══════════════════════════════════════════════════════════════════╝
 //
 // Modal has TWO variants depending on program type:
 //   ┌─ Fixed-term plans (10-Year, 5-Year)
@@ -18,11 +21,9 @@
 //        Starts On  +  Next Billing Date
 //
 // Logic:
-//   • Starts On        → always set to Sold On date
-//   • Ends On          → Sold On + 10 or 5 years  (fixed-term only)
-//   • Next Billing Date→ Sold On + 1 year          (auto-renew only)
-//
-// Deploy on Render, trigger via POST /run-membership-fix from n8n
+//   • Starts On         → always set to Sold On date
+//   • Ends On           → Sold On + 10 or 5 years  (fixed-term only)
+//   • Next Billing Date → Sold On + 1 year          (auto-renew only)
 
 import { Stagehand, V3 } from "@browserbasehq/stagehand";
 import express, { Request, Response } from "express";
@@ -31,9 +32,7 @@ import express, { Request, Response } from "express";
 // TYPES
 // =============================================================================
 
-// Derive the Page type directly from V3's context — it is not a public export
-type SPage = NonNullable<ReturnType<V3["context"]["activePage"]>>;
-
+type SPage       = NonNullable<ReturnType<V3["context"]["activePage"]>>;
 type ModalVariant = "ends-on" | "next-billing" | "unknown";
 
 interface MembershipRow {
@@ -51,7 +50,7 @@ interface ProcessedEntry {
   program: string;
   soldOn: string;
   startsOn: string;
-  secondDateField: string; // "Ends On" or "Next Billing Date"
+  secondDateField: string;
   secondDateValue: string;
   message: string;
 }
@@ -80,12 +79,19 @@ interface TaskResult {
 // HELPERS
 // =============================================================================
 
-/**
- * Guesses which modal variant a program uses from its name:
- *   "ends-on"      → 10-Year or 5-Year fixed plans
- *   "next-billing" → Auto-Renew / recurring plans
- * detectModalVariant() below confirms this against the live DOM after opening.
- */
+function calcSecondDate(soldOn: string, programName: string): string {
+  const parts = soldOn.split("/");
+  if (parts.length !== 3) return soldOn;
+  const month = parts[0];
+  const day   = parts[1];
+  const year  = parseInt(parts[2], 10);
+  const n     = programName.toLowerCase();
+  let add = 1;
+  if (n.includes("10-year") || n.includes("10 year")) add = 10;
+  else if (n.includes("5-year") || n.includes("5 year")) add = 5;
+  return `${month}/${day}/${year + add}`;
+}
+
 function getModalVariant(programName: string): ModalVariant {
   const n = programName.toLowerCase();
   if (n.includes("10-year") || n.includes("10 year")) return "ends-on";
@@ -93,32 +99,7 @@ function getModalVariant(programName: string): ModalVariant {
   return "next-billing";
 }
 
-/**
- * Calculates the second date:
- *   10-year plans → soldOn + 10 years
- *   5-year plans  → soldOn + 5 years
- *   everything else (auto-renew) → soldOn + 1 year
- */
-function calcSecondDate(soldOn: string, programName: string): string {
-  const parts = soldOn.split("/");
-  if (parts.length !== 3) return soldOn;
-
-  const month = parts[0];
-  const day   = parts[1];
-  const year  = parseInt(parts[2], 10);
-  const n     = programName.toLowerCase();
-
-  let add = 1;
-  if (n.includes("10-year") || n.includes("10 year")) add = 10;
-  else if (n.includes("5-year") || n.includes("5 year")) add = 5;
-
-  return `${month}/${day}/${year + add}`;
-}
-
-/**
- * Reads the live DOM after the modal opens to confirm which second-date
- * field is present — more reliable than guessing from program name alone.
- */
+/** Read the open modal DOM to confirm which second-date field is present. */
 async function detectModalVariant(page: SPage): Promise<ModalVariant> {
   return page.evaluate((): ModalVariant => {
     const t = document.body.innerText.toLowerCase();
@@ -129,18 +110,120 @@ async function detectModalVariant(page: SPage): Promise<ModalVariant> {
 }
 
 /**
- * Asks Stagehand's AI to click and fill a date field in the open modal.
- * act() lives on the V3 (stagehand) instance — NOT on the page object.
+ * Fill a date input identified by its visible label.
+ * Strategy:
+ *   1) Find the <label> whose text matches labelText
+ *   2) Use its `for` attribute (or closest input sibling) to find the input
+ *   3) Triple-click to select all, then type the new date
+ * Falls back to searching by placeholder/aria-label if no <label> found.
+ * Pure CDP — no AI involved.
  */
-async function fillDateField(
-  stagehand: V3,
-  fieldLabel: string,
+async function fillDateByLabel(
+  page: SPage,
+  labelText: string,
   dateValue: string
 ): Promise<void> {
-  await stagehand.act(
-    `In the open Edit Memberships modal, click the "${fieldLabel}" date input field, ` +
-    `select all existing text in it, and replace it with the date ${dateValue}`
-  );
+  // Find the input linked to the label via DOM evaluation, then fill it
+  const selector: string = await page.evaluate((lbl: string): string => {
+    // Find label by text content (case-insensitive)
+    const labels = Array.from(document.querySelectorAll<HTMLLabelElement>("label"));
+    const label  = labels.find(
+      (el) => el.textContent?.trim().toLowerCase() === lbl.toLowerCase()
+    );
+
+    if (label) {
+      const forId = label.getAttribute("for");
+      if (forId) return `#${forId}`;
+      // Input may be a sibling or child
+      const sibling = label.nextElementSibling as HTMLElement | null;
+      if (sibling?.tagName === "INPUT") {
+        sibling.id = sibling.id || `__sh_${Math.random().toString(36).slice(2)}`;
+        return `#${sibling.id}`;
+      }
+      const child = label.querySelector<HTMLInputElement>("input");
+      if (child) {
+        child.id = child.id || `__sh_${Math.random().toString(36).slice(2)}`;
+        return `#${child.id}`;
+      }
+    }
+
+    // Fallback: look for input whose preceding label text matches
+    const allInputs = Array.from(document.querySelectorAll<HTMLInputElement>("input[type='text'], input[type='date'], input:not([type])"));
+    for (const inp of allInputs) {
+      // Check aria-label
+      if (inp.getAttribute("aria-label")?.toLowerCase() === lbl.toLowerCase()) {
+        inp.id = inp.id || `__sh_${Math.random().toString(36).slice(2)}`;
+        return `#${inp.id}`;
+      }
+      // Check placeholder
+      if (inp.placeholder?.toLowerCase().includes(lbl.toLowerCase())) {
+        inp.id = inp.id || `__sh_${Math.random().toString(36).slice(2)}`;
+        return `#${inp.id}`;
+      }
+    }
+
+    return "";
+  }, labelText);
+
+  if (!selector) {
+    throw new Error(`Could not find input for label "${labelText}"`);
+  }
+
+  const locator = page.locator(selector).first();
+
+  // Triple-click selects all existing text, then type new value
+  await locator.click({ clickCount: 3 });
+  await page.waitForTimeout(200);
+  await locator.fill(dateValue);
+  await page.waitForTimeout(300);
+}
+
+/**
+ * Click the "Save & Complete" button using a direct CDP locator.
+ * Tries multiple selectors in order of specificity.
+ * Pure CDP — no AI involved.
+ */
+async function clickSaveAndComplete(page: SPage): Promise<void> {
+  // Build a prioritised list of selectors for the Save & Complete button
+  const selectors = [
+    "button:has-text('Save & Complete')",
+    "button:has-text('Save and Complete')",
+    // Generic: any visible button whose text is exactly "Save & Complete"
+    // (resolved via evaluate to get a stable ID, then click by ID)
+  ];
+
+  // Try CSS/text-based locators first
+  for (const sel of selectors) {
+    try {
+      const loc = page.locator(sel).first();
+      const visible = await loc.isVisible().catch(() => false);
+      if (visible) {
+        await loc.click();
+        return;
+      }
+    } catch {
+      // try next
+    }
+  }
+
+  // Fallback: find button by text via evaluate, assign a stable ID, then click
+  const btnId: string = await page.evaluate((): string => {
+    const buttons = Array.from(document.querySelectorAll<HTMLElement>("button, input[type='submit'], [role='button']"));
+    const btn = buttons.find((el) => {
+      const txt = el.textContent?.trim().toLowerCase() ?? "";
+      return txt === "save & complete" || txt === "save and complete";
+    });
+    if (!btn) return "";
+    const id = `__save_btn_${Math.random().toString(36).slice(2)}`;
+    btn.id = id;
+    return id;
+  });
+
+  if (!btnId) {
+    throw new Error("Save & Complete button not found in DOM");
+  }
+
+  await page.locator(`#${btnId}`).first().click();
 }
 
 // =============================================================================
@@ -169,9 +252,6 @@ async function runMembershipTask(): Promise<TaskResult> {
     sessionUrl = `https://browserbase.com/sessions/${stagehand.browserbaseSessionID}`;
     console.log(`✅ Session started: ${sessionUrl}`);
 
-    // In v3 the page lives in stagehand.context — activePage() returns the
-    // current top-level page. We use it for all DOM/navigation operations.
-    // AI actions (act) are called on stagehand directly.
     const page: SPage = stagehand.context.activePage()!;
 
     // ------------------------------------------------------------------
@@ -189,6 +269,7 @@ async function runMembershipTask(): Promise<TaskResult> {
       await page.locator('input[type="password"]').first().fill(password);
       await page.waitForTimeout(500);
 
+      // Click the login submit button directly
       const clicked: boolean = await page.evaluate((): boolean => {
         const keywords = ["sign in", "login", "log in"];
         const btn = Array.from(
@@ -229,7 +310,7 @@ async function runMembershipTask(): Promise<TaskResult> {
     console.log(`    ℹ️  URL: ${page.url()}`);
 
     // ------------------------------------------------------------------
-    // STEP 3 — Read ALL rows before clicking anything
+    // STEP 3 — Read ALL rows before touching anything
     // ------------------------------------------------------------------
     console.log("\n[3] → Scanning membership table …");
 
@@ -238,16 +319,13 @@ async function runMembershipTask(): Promise<TaskResult> {
       document.querySelectorAll("table tbody tr").forEach((row, idx) => {
         const cells = row.querySelectorAll("td");
         if (cells.length < 5) return;
-
         const soldOn   = cells[0]?.textContent?.trim() ?? "";
         const invoice  = cells[1]?.textContent?.trim() ?? "";
         const job      = cells[2]?.textContent?.trim() ?? "";
         const customer = cells[3]?.textContent?.trim() ?? "";
         const program  = cells[4]?.textContent?.trim() ?? "";
-
         if (!soldOn.match(/\d{2}\/\d{2}\/\d{4}/)) return;
         if (soldOn.includes("#") || program.includes("#")) return;
-
         result.push({ soldOn, invoice, job, customer, program, rowIndex: idx });
       });
       return result;
@@ -272,7 +350,7 @@ async function runMembershipTask(): Promise<TaskResult> {
     }
 
     // ------------------------------------------------------------------
-    // STEP 4 — Process each row: reload → click → detect modal → fill → save
+    // STEP 4 — Process each row
     // ------------------------------------------------------------------
     for (let i = 0; i < allRows.length; i++) {
       const row             = allRows[i];
@@ -285,18 +363,17 @@ async function runMembershipTask(): Promise<TaskResult> {
       console.log(`  Sold On  : ${row.soldOn}`);
       console.log(`  Expected : ${expectedVariant === "ends-on" ? "Ends On" : "Next Billing Date"} → ${secondDate}`);
 
-      // Fresh reload for every row — no stale modals or DOM state
+      // Fresh reload for every row
       await page.goto("https://misterquik.sera.tech/memberships");
       await page.waitForTimeout(4000);
 
       // ----------------------------------------------------------------
-      // 4a — Click the program link via DOM (fast, no AI token cost)
+      // 4a — Click the program link via DOM (no AI)
       // ----------------------------------------------------------------
       console.log(`  → Clicking: "${row.program}"`);
 
       const clickResult: string = await page.evaluate((target: string): string => {
         const links = Array.from(document.querySelectorAll<HTMLAnchorElement>("a"));
-
         const exact = links.find(
           (el) =>
             el.textContent?.trim().toLowerCase() === target.toLowerCase() &&
@@ -319,7 +396,7 @@ async function runMembershipTask(): Promise<TaskResult> {
       await page.waitForTimeout(3000);
 
       // ----------------------------------------------------------------
-      // 4b — Confirm modal opened; fallback to stagehand.act() if needed
+      // 4b — Confirm modal opened
       // ----------------------------------------------------------------
       let modalOpen: boolean = await page.evaluate((): boolean => {
         const el = document.querySelector<HTMLElement>(
@@ -329,23 +406,24 @@ async function runMembershipTask(): Promise<TaskResult> {
       });
 
       if (!modalOpen) {
-        console.log(`  ⚠️  Modal not detected — trying stagehand.act() fallback …`);
-        try {
-          // act() is on the stagehand (V3) instance, not on page
-          await stagehand.act(
-            `Click the program name link "${row.program}" in the memberships table ` +
-            `to open the Edit Memberships modal`
+        // Fallback: try clicking by button/link text via evaluate
+        console.log(`  ⚠️  Modal not detected — trying evaluate fallback …`);
+        await page.evaluate((target: string): void => {
+          const all = Array.from(document.querySelectorAll<HTMLElement>("a, button, td, span"));
+          const el = all.find(
+            (e) => e.textContent?.trim().toLowerCase().includes(target.toLowerCase().substring(0, 10)) &&
+                   e.offsetParent !== null
           );
-          await page.waitForTimeout(3000);
-          modalOpen = await page.evaluate((): boolean => {
-            const el = document.querySelector<HTMLElement>(
-              '.modal, [role="dialog"], [class*="modal"], [class*="Modal"], sera-modal'
-            );
-            return !!(el && el.offsetParent !== null);
-          });
-        } catch (e: unknown) {
-          console.log(`  ⚠️  stagehand.act() fallback failed: ${e instanceof Error ? e.message : e}`);
-        }
+          if (el) el.click();
+        }, row.program);
+        await page.waitForTimeout(3000);
+
+        modalOpen = await page.evaluate((): boolean => {
+          const el = document.querySelector<HTMLElement>(
+            '.modal, [role="dialog"], [class*="modal"], [class*="Modal"], sera-modal'
+          );
+          return !!(el && el.offsetParent !== null);
+        });
       }
 
       if (!modalOpen) {
@@ -357,53 +435,52 @@ async function runMembershipTask(): Promise<TaskResult> {
       console.log(`  ✅ Modal is open`);
 
       // ----------------------------------------------------------------
-      // 4c — Detect actual modal variant from live DOM
+      // 4c — Detect actual variant from live DOM
       // ----------------------------------------------------------------
       const actualVariant    = await detectModalVariant(page);
       const variantToUse     = actualVariant !== "unknown" ? actualVariant : expectedVariant;
       const secondFieldLabel = variantToUse === "ends-on" ? "Ends On" : "Next Billing Date";
-
       console.log(`  ℹ️  Modal variant: "${secondFieldLabel}"`);
 
       // ----------------------------------------------------------------
-      // 4d — Set "Starts On" = Sold On date
+      // 4d — Set "Starts On" = Sold On (pure CDP fill, no AI)
       // ----------------------------------------------------------------
       console.log(`  → Setting "Starts On" → ${row.soldOn}`);
       let startsOnSet = false;
 
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          await fillDateField(stagehand, "Starts On", row.soldOn);
-          await page.waitForTimeout(1500);
+          await fillDateByLabel(page, "Starts On", row.soldOn);
+          await page.waitForTimeout(1000);
           console.log(`  ✅ Starts On set (attempt ${attempt})`);
           startsOnSet = true;
           break;
         } catch (e: unknown) {
           console.log(`  ⚠️  Starts On attempt ${attempt}: ${e instanceof Error ? e.message : e}`);
-          await page.waitForTimeout(1000);
+          await page.waitForTimeout(800);
         }
       }
 
       if (!startsOnSet) console.log(`  ⚠️  Could not set Starts On — proceeding anyway`);
 
       // ----------------------------------------------------------------
-      // 4e — Set "Ends On" or "Next Billing Date"
+      // 4e — Set "Ends On" or "Next Billing Date" (pure CDP fill, no AI)
       // ----------------------------------------------------------------
       console.log(`  → Setting "${secondFieldLabel}" → ${secondDate}`);
       try {
-        await fillDateField(stagehand, secondFieldLabel, secondDate);
-        await page.waitForTimeout(1500);
+        await fillDateByLabel(page, secondFieldLabel, secondDate);
+        await page.waitForTimeout(1000);
         console.log(`  ✅ "${secondFieldLabel}" set`);
       } catch (e: unknown) {
         console.log(`  ⚠️  "${secondFieldLabel}" error: ${e instanceof Error ? e.message : e}`);
       }
 
       // ----------------------------------------------------------------
-      // 4f — Save & Complete
+      // 4f — Click "Save & Complete" (pure CDP click, no AI)
       // ----------------------------------------------------------------
       console.log(`  → Clicking "Save & Complete" …`);
       try {
-        await stagehand.act(`Click the "Save & Complete" button in the open Edit Memberships modal`);
+        await clickSaveAndComplete(page);
         await page.waitForTimeout(3000);
         console.log(`  ✅ Saved`);
 
