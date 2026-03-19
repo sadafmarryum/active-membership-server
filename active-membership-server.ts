@@ -10,77 +10,74 @@ import express from "express";
 // =============================================================================
 
 const MEMBERSHIP_PROMPT = `
-GENERAL RULES (CRITICAL - STRICT ENFORCEMENT):
+IMPORTANT CONTEXT:
+- You are already logged in and already on the Memberships To-Do page.
+- The page URL is: https://misterquik.sera.tech/memberships
+- The page title is "Memberships To-Do"
+- The table has these columns: SOLD ON | INVOICE | JOB | CUSTOMER | PROGRAM | SYSTEMS | DEPARTMENT | OWNER | COMPLETE
+- To open the Edit Membership modal: click the PROGRAM name link (e.g. "10-Year Shape Plan") in the PROGRAM column.
+- Do NOT click Invoice number or Job number — only click the PROGRAM name.
+- Do NOT navigate anywhere. Do NOT login. Start processing immediately.
+
+GENERAL RULES:
 - Never retry the same action more than 3 times.
-- If Sold On date and Starts On date do NOT match exactly, DO NOT save.
-- If equality cannot be achieved after retries, STOP execution and report failure.
+- If Sold On date and Starts On date do NOT match exactly after 3 retries, DO NOT save — report failure.
 - Always wait for modals or page loads to fully appear before interacting.
 - Verify success after every major step.
-- Do NOT rely on vertical scrolling to reveal hidden content.
 
 DATE SYNCHRONIZATION RULE (HIGHEST PRIORITY):
-- The Sold On table date is the SINGLE SOURCE OF TRUTH.
-- Inside the Edit Membership modal, the Starts On date MUST be EXACTLY equal to Sold On.
+- The Sold On date shown in the table row is the SINGLE SOURCE OF TRUTH.
+- Inside the Edit Membership modal, the Starts On date MUST be EXACTLY equal to the Sold On date.
 - Month, day, and year must match character-for-character.
-- If the modal auto-adjusts the date, overwrite it.
-- Saving is FORBIDDEN unless both dates are identical.
+- If the modal auto-adjusts the date, overwrite it with the correct Sold On date.
+- Saving is FORBIDDEN unless Starts On exactly equals Sold On.
 
-DATE PICKER INTERACTION RULES:
-- Always use the calendar/date-picker widget.
+DATE PICKER RULES:
+- Always use the calendar/date-picker widget to set dates.
 - Clear the date field before selecting a new value.
-- Select the exact Sold On date.
-- After selection, visually re-read the field.
-- Compare Starts On vs Sold On before continuing.
+- After selection, re-read the field value to confirm it matches.
 
-IMPORTANT: You are already logged in and already on the Memberships To-Do page at
-https://misterquik.sera.tech/memberships
-DO NOT navigate to login. DO NOT click Dispatch. Start directly from Step 3 below.
+NEXT BILLING DATE CALCULATION:
+- Month and day must be exactly the same as Starts On.
+- Year is calculated based on the program name:
+    - If program contains "10-Year" → add 10 years to Starts On year
+    - If program contains "5-Year"  → add 5 years to Starts On year
+    - If program contains "Auto-Renew" → add 1 year to Starts On year
 
-STEP 3: Process Memberships With Pagination Loop
-REPEAT for all pages:
+PROCESSING STEPS — repeat for EVERY row in the table:
 
-A. For EACH membership row:
-1. Read and store the Sold On date from the table
-2. Click the Program name to open Edit Membership modal
-3. WAIT until modal is fully visible
-4. SUCCESS CHECK: Modal is open
+1. Read the Sold On date from the current row (e.g. "03/19/2026")
+2. Read the Program name from the PROGRAM column (e.g. "10-Year Shape Plan")
+3. Read the Customer name from the CUSTOMER column
+4. Read the Job number from the JOB column
+5. Click the PROGRAM name link to open the Edit Membership modal
+6. Wait for the Edit Membership modal to fully open
+7. In the modal:
+   a. Find the "Starts On" date field
+   b. Clear it and set it to exactly the Sold On date from step 1
+   c. Re-read the Starts On field to confirm it matches Sold On exactly
+   d. If it does not match, retry up to 3 times — if still wrong, stop and report error
+   e. Calculate the Next Billing Date: same month and day as Starts On, year + offset based on program
+   f. Set the Next Billing Date using the date picker
+   g. Confirm Next Billing Date is correct
+   h. Confirm Starts On still equals Sold On
+   i. Confirm no validation errors are visible
+   j. Click "Save & Complete"
+   k. Wait for the modal to close
+   l. Confirm the row is now marked as complete
 
-STARTS ON ENFORCEMENT LOOP:
-5. Click Starts On field
-6. Clear existing value
-7. Use date picker to select the EXACT Sold On date
-8. Re-read the Starts On value
-9. IF Starts On is not equal to Sold On:
-   - Repeat steps 5 to 8 (maximum 3 attempts)
-10. IF still not equal after 3 attempts:
-   - STOP execution and report mismatch error
+PAGINATION:
+- After processing all rows on the current page, check if a next page button exists.
+- If yes, click next page and repeat the processing steps.
+- If no, stop.
 
-NEXT BILLING DATE:
-11. Calculate from Starts On:
-   - Month and day MUST be exactly the same as Starts On
-   - Year = Starts On year + 1/5/10 according to program:
-       - If program contains "10-Year" add 10 years
-       - If program contains "5-Year" add 5 years
-       - If program contains "Auto-Renew" add 1 year
-12. Set using the date picker
-13. Verify displayed value matches expected month/day/year
+FINAL REPORT:
+When all memberships are processed, output a summary that includes:
+- Total memberships processed
+- For each membership: Customer Name, Job Number, Program, Starts On date set, Next Billing Date set
+- Example: "Processed 1 membership: Chuck Dotson | Job #8943860 | 10-Year Shape Plan | Starts On: 03/19/2026 | Next Billing: 03/19/2036"
 
-FINAL VALIDATION BEFORE SAVE:
-14. Confirm Starts On EXACTLY equals Sold On
-15. Confirm Next Billing Date matches expected month/day/year
-16. Ensure no validation errors are visible
-17. Click "Save & Complete"
-18. WAIT until modal closes
-19. SUCCESS CHECK: Membership saved
-
-B. Pagination:
-1. If next page exists go to next
-2. Otherwise exit loop
-
-STEP 4: Final Report
-Output: "Membership date correction completed for all available memberships. For each processed membership, include the Customer Name and Job Number in the final message."
-
-STOP EXECUTION.
+STOP EXECUTION after the final report.
 `.trim();
 
 // =============================================================================
@@ -174,35 +171,80 @@ async function runMembershipTask() {
     }
 
     // ------------------------------------------------------------------
-    // STEP 2 — Navigate DIRECTLY to memberships page
-    // Do not rely on sidebar — go straight to the URL
+    // STEP 2 — Navigate directly to memberships page
     // ------------------------------------------------------------------
-    console.log("\n[2] → Navigating directly to Memberships page");
+    console.log("\n[2] → Navigating to Memberships page");
     await page.goto("https://misterquik.sera.tech/memberships");
     await page.waitForTimeout(5000);
 
-    // Confirm page loaded correctly
     const pageUrl: string = await page.url();
     console.log(`    ℹ️  Current URL: ${pageUrl}`);
 
-    const pageText: string = await page.evaluate(() => {
-      return document.body.textContent?.substring(0, 200) || "";
-    });
-    console.log(`    ℹ️  Page content preview: ${pageText.replace(/\s+/g, " ").trim()}`);
-
-    // Wait for table to appear
+    // Wait for table to load
     try {
-      await waitUntilVisible(page, "table, tbody, .memberships-table, [class*='membership']", 15000);
-      console.log("    ✅ Memberships table is visible");
+      await waitUntilVisible(page, "table tbody tr, .memberships-table tr", 15000);
+      console.log("    ✅ Memberships table loaded");
     } catch {
-      console.log("    ⚠️  Table not found via selector — agent will handle it visually");
+      console.log("    ⚠️  Table selector not found — agent will handle visually");
+    }
+
+    // Log what rows are visible so we can confirm page loaded
+    const rowData: string[] = await page.evaluate(() => {
+      const rows = Array.from(document.querySelectorAll("table tbody tr"));
+      return rows.map(r => r.textContent?.replace(/\s+/g, " ").trim() || "").filter(t => t.length > 0);
+    });
+    console.log(`    ℹ️  Found ${rowData.length} row(s) in table`);
+    rowData.forEach((r, i) => console.log(`    Row ${i + 1}: ${r.substring(0, 100)}`));
+
+    // ------------------------------------------------------------------
+    // STEP 3 — Click the first program link via DOM to confirm it works
+    // then let agent handle the modal and all subsequent rows
+    // ------------------------------------------------------------------
+    console.log("\n[3] → Clicking first Program link to open Edit Membership modal");
+
+    // Find and click the program link directly — from screenshot it's a blue link in PROGRAM column
+    const programClicked = await page.evaluate(() => {
+      // The program name is a link — find it in the table
+      // From screenshot: "10-Year Shape Plan" is a clickable link
+      const links = Array.from(document.querySelectorAll("table tbody tr td a, table tbody tr td button"));
+      // Skip invoice and job number links (they are numeric) — find the text link
+      const programLink = links.find(el => {
+        const text = el.textContent?.trim() || "";
+        // Program names contain words like "Year", "Plan", "Auto", "Shape", "Renew"
+        return text.length > 5 && !/^\d+$/.test(text) && !text.includes("@");
+      }) as HTMLElement | null;
+      if (programLink) {
+        const text = programLink.textContent?.trim();
+        programLink.click();
+        return text;
+      }
+      return null;
+    });
+
+    if (programClicked) {
+      console.log(`    ✅ Clicked program: "${programClicked}"`);
+      await page.waitForTimeout(3000);
+
+      // Check if modal opened
+      const modalVisible = await page.evaluate(() => {
+        const modal = document.querySelector('.modal, [role="dialog"], .modal-content, [class*="modal"]');
+        return modal !== null && (modal as HTMLElement).offsetParent !== null;
+      });
+      console.log(`    ℹ️  Modal visible: ${modalVisible}`);
+
+      if (modalVisible) {
+        console.log("    ✅ Modal opened successfully — handing off to AI agent");
+      } else {
+        console.log("    ⚠️  Modal did not open via DOM click — agent will retry visually");
+      }
+    } else {
+      console.log("    ⚠️  Program link not found via DOM — agent will handle from scratch");
     }
 
     // ------------------------------------------------------------------
-    // STEP 3 — Hand off to AI agent for complex membership work
-    // Agent starts from the already-loaded memberships page
+    // STEP 4 — Hand off to AI agent
     // ------------------------------------------------------------------
-    console.log("\n[3] → Starting AI agent for membership processing");
+    console.log("\n[4] → Starting AI agent");
     console.log(`    🔍 Watch live: ${sessionUrl}`);
 
     const agent = stagehand.agent({
