@@ -1,12 +1,13 @@
 // active-membership-server.ts
 // Express server + Stagehand v3 browser automation
 //
-// FIXES in this version:
-//   1. Program link click — waits for table to render, uses text= selector
-//      (which triggers Stagehand's shadow-DOM pierce fallback automatically)
-//   2. Save & Complete — uses text= selector so it pierces sera-modal shadow DOM
-//   3. Date fields — uses label-based DOM walk + locator.fill(), no AI
-//   4. No stagehand.act() anywhere — zero Gemini / schema validation calls
+// KEY FIX in this version:
+//   "Save & Complete" now uses a real CDP mouse click (scroll into view →
+//   get bounding box → Input.dispatchMouseEvent) instead of a JS .click()
+//   DOM event. This is required because SERA's button is inside a sera-modal
+//   web component shadow root and only responds to real pointer events.
+//
+//   After clicking Save, we verify success by waiting for the modal to close.
 //
 // Modal variants:
 //   10-Year / 5-Year plans  →  Starts On  +  Ends On
@@ -62,8 +63,32 @@ interface TaskResult {
   sessionUrl: string;
 }
 
+// CDP types for box model response
+interface CdpBoxModel {
+  model: {
+    content: number[];
+    padding: number[];
+    border: number[];
+    margin: number[];
+    width: number;
+    height: number;
+  };
+}
+
+interface CdpResolveNode {
+  object: { objectId: string };
+}
+
+interface CdpRequestNode {
+  nodeId: number;
+}
+
+interface CdpDescribeNode {
+  node: { backendNodeId: number };
+}
+
 // =============================================================================
-// HELPERS — pure date math
+// DATE HELPERS
 // =============================================================================
 
 function getModalVariant(programName: string): ModalVariant {
@@ -86,13 +111,9 @@ function calcSecondDate(soldOn: string, programName: string): string {
 }
 
 // =============================================================================
-// HELPERS — page interactions (pure CDP, no AI)
+// PAGE HELPERS
 // =============================================================================
 
-/**
- * Wait for the memberships table to appear and return all valid rows.
- * Retries up to maxWaitMs before giving up.
- */
 async function waitForTableRows(page: SPage, maxWaitMs = 10000): Promise<MembershipRow[]> {
   const deadline = Date.now() + maxWaitMs;
   while (Date.now() < deadline) {
@@ -118,79 +139,43 @@ async function waitForTableRows(page: SPage, maxWaitMs = 10000): Promise<Members
   return [];
 }
 
-/**
- * Click a program link by its exact text.
- * Uses the text= selector which Stagehand resolves with its pierce fallback,
- * so it works even if the link is inside a shadow root.
- * Returns true if the click was dispatched.
- */
 async function clickProgramLink(page: SPage, programName: string): Promise<boolean> {
-  // Primary: text= selector (Stagehand pierces shadow DOM automatically)
+  // Primary: text= selector (triggers Stagehand shadow-DOM pierce fallback)
   try {
     const loc = page.locator(`text=${programName}`).first();
     const visible = await loc.isVisible().catch(() => false);
-    if (visible) {
-      await loc.click();
-      return true;
-    }
-  } catch {
-    // fall through
-  }
+    if (visible) { await loc.click(); return true; }
+  } catch { /* fall through */ }
 
-  // Fallback: DOM evaluate — find <a> by text content and dispatch click
-  const clicked: boolean = await page.evaluate((target: string): boolean => {
+  // Fallback: DOM evaluate
+  return page.evaluate((target: string): boolean => {
     const links = Array.from(document.querySelectorAll<HTMLAnchorElement>("a"));
-    const el = links.find(
-      (a) =>
-        a.textContent?.trim().toLowerCase() === target.toLowerCase() &&
-        (a as HTMLElement).offsetParent !== null
+    const exact = links.find(
+      (a) => a.textContent?.trim().toLowerCase() === target.toLowerCase() && a.offsetParent !== null
     );
-    if (el) { el.click(); return true; }
-
-    // partial match fallback (first 12 chars)
+    if (exact) { exact.click(); return true; }
     const partial = links.find(
       (a) =>
         a.textContent?.trim().toLowerCase().startsWith(target.toLowerCase().substring(0, 12)) &&
-        (a as HTMLElement).offsetParent !== null &&
-        !/^\d+$/.test(a.textContent?.trim() ?? "")
+        a.offsetParent !== null && !/^\d+$/.test(a.textContent?.trim() ?? "")
     );
     if (partial) { partial.click(); return true; }
-
     return false;
   }, programName);
-
-  return clicked;
 }
 
-/**
- * Wait for the Edit Memberships modal to open.
- * Returns true when a modal is visible.
- */
-async function waitForModal(page: SPage, timeoutMs = 5000): Promise<boolean> {
+async function waitForModal(page: SPage, timeoutMs = 6000): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const open: boolean = await page.evaluate((): boolean => {
-      // Standard selectors
       const standard = document.querySelector<HTMLElement>(
-        '.modal[style*="display: block"], .modal.show, [role="dialog"], [class*="Modal"]:not([class*="backdrop"])'
+        '.modal[style*="display: block"], .modal.show, [role="dialog"]'
       );
       if (standard && standard.offsetParent !== null) return true;
-
-      // sera-modal web component — check its shadow root
       const seraModal = document.querySelector("sera-modal");
-      if (seraModal && seraModal.shadowRoot) {
-        const inner = seraModal.shadowRoot.querySelector<HTMLElement>(".modal, [class*='modal']");
-        if (inner && inner.offsetParent !== null) return true;
-        // If shadowRoot exists and has content, the modal is open
-        if (seraModal.shadowRoot.childElementCount > 0) return true;
-      }
-
-      // Check if any h5/h4 with "Edit Memberships" text is visible
-      const headers = Array.from(document.querySelectorAll<HTMLElement>("h5, h4, h3, .modal-title"));
-      return headers.some(
-        (h) =>
-          h.textContent?.includes("Edit Memberships") &&
-          h.offsetParent !== null
+      if (seraModal?.shadowRoot && seraModal.shadowRoot.childElementCount > 0) return true;
+      return Array.from(document.querySelectorAll<HTMLElement>("h5, h4, .modal-title")).some(
+        (h) => h.textContent?.includes("Edit Memberships") && h.offsetParent !== null
       );
     });
     if (open) return true;
@@ -199,51 +184,56 @@ async function waitForModal(page: SPage, timeoutMs = 5000): Promise<boolean> {
   return false;
 }
 
-/**
- * Detect which second-date field the modal actually shows.
- * Checks both regular DOM and sera-modal shadow root.
- */
+/** Wait for the modal to CLOSE (row saved → modal dismissed) */
+async function waitForModalClose(page: SPage, timeoutMs = 8000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const stillOpen: boolean = await page.evaluate((): boolean => {
+      const seraModal = document.querySelector("sera-modal");
+      if (seraModal?.shadowRoot && seraModal.shadowRoot.childElementCount > 0) return true;
+      const standard = document.querySelector<HTMLElement>(
+        '.modal[style*="display: block"], .modal.show, [role="dialog"]'
+      );
+      if (standard && standard.offsetParent !== null) return true;
+      return Array.from(document.querySelectorAll<HTMLElement>("h5, h4, .modal-title")).some(
+        (h) => h.textContent?.includes("Edit Memberships") && h.offsetParent !== null
+      );
+    });
+    if (!stillOpen) return true; // modal closed = save succeeded
+    await page.waitForTimeout(300);
+  }
+  return false; // timed out — modal never closed
+}
+
 async function detectModalVariant(page: SPage): Promise<ModalVariant> {
   return page.evaluate((): ModalVariant => {
-    // Check main DOM
     const mainText = document.body.innerText.toLowerCase();
     if (mainText.includes("ends on"))      return "ends-on";
     if (mainText.includes("next billing")) return "next-billing";
-
-    // Check sera-modal shadow root
     const seraModal = document.querySelector("sera-modal");
     if (seraModal?.shadowRoot) {
-      const shadowText = seraModal.shadowRoot.textContent?.toLowerCase() ?? "";
-      if (shadowText.includes("ends on"))      return "ends-on";
-      if (shadowText.includes("next billing")) return "next-billing";
+      const shadow = seraModal.shadowRoot.textContent?.toLowerCase() ?? "";
+      if (shadow.includes("ends on"))      return "ends-on";
+      if (shadow.includes("next billing")) return "next-billing";
     }
     return "unknown";
   });
 }
 
-/**
- * Fill a date input field identified by its visible label.
- * Searches both normal DOM and sera-modal shadow root.
- * Uses triple-click + fill to replace the existing date.
- */
 async function fillDateByLabel(page: SPage, labelText: string, dateValue: string): Promise<void> {
-  // Assign a stable ID to the input so we can target it with a locator
   const inputId: string = await page.evaluate(
     (args: { label: string; id: string }): string => {
       const { label, id } = args;
 
-      // Helper: find input associated with a label element
       const findInputForLabel = (lbl: HTMLLabelElement): HTMLInputElement | null => {
         const forAttr = lbl.getAttribute("for");
         if (forAttr) {
           const el = document.getElementById(forAttr) as HTMLInputElement | null;
           if (el) return el;
         }
-        const sibling = lbl.nextElementSibling as HTMLInputElement | null;
-        if (sibling?.tagName === "INPUT") return sibling;
-        // Input may be wrapped in a div/span after the label
         let next = lbl.nextElementSibling;
         while (next) {
+          if ((next as HTMLInputElement).tagName === "INPUT") return next as HTMLInputElement;
           const inp = next.querySelector<HTMLInputElement>("input");
           if (inp) return inp;
           next = next.nextElementSibling;
@@ -251,47 +241,35 @@ async function fillDateByLabel(page: SPage, labelText: string, dateValue: string
         return lbl.querySelector<HTMLInputElement>("input");
       };
 
-      // Search in a given root (document or shadow root)
       const searchRoot = (root: Document | ShadowRoot): HTMLInputElement | null => {
-        const labels = Array.from(root.querySelectorAll<HTMLLabelElement>("label"));
-        const lbl = labels.find(
+        const lbl = Array.from(root.querySelectorAll<HTMLLabelElement>("label")).find(
           (el) => el.textContent?.trim().toLowerCase() === label.toLowerCase()
         );
-        if (lbl) return findInputForLabel(lbl);
-        return null;
+        return lbl ? findInputForLabel(lbl) : null;
       };
 
-      // Try main DOM first
       let inp = searchRoot(document);
-
-      // Try sera-modal shadow root
       if (!inp) {
-        const seraModal = document.querySelector("sera-modal");
-        if (seraModal?.shadowRoot) {
-          inp = searchRoot(seraModal.shadowRoot);
-        }
+        const sm = document.querySelector("sera-modal");
+        if (sm?.shadowRoot) inp = searchRoot(sm.shadowRoot);
       }
-
       if (!inp) return "";
+
       inp.id = inp.id || id;
       return inp.id;
     },
     { label: labelText, id: `__sh_${labelText.replace(/\s+/g, "_").toLowerCase()}_${Date.now()}` }
   );
 
-  if (!inputId) {
-    throw new Error(`Could not find input for label "${labelText}"`);
-  }
+  if (!inputId) throw new Error(`Input not found for label "${labelText}"`);
 
   const loc = page.locator(`#${inputId}`).first();
-
-  // Triple-click selects all existing text, then fill replaces it
   await loc.click({ clickCount: 3 });
   await page.waitForTimeout(150);
   await loc.fill(dateValue);
-  await page.waitForTimeout(300);
+  await page.waitForTimeout(200);
 
-  // Trigger change event so the app registers the new value
+  // Fire change/blur so the framework registers the new value
   await page.evaluate((id: string): void => {
     const el = document.getElementById(id);
     if (el) {
@@ -300,70 +278,144 @@ async function fillDateByLabel(page: SPage, labelText: string, dateValue: string
       el.dispatchEvent(new Event("blur",   { bubbles: true }));
     }
   }, inputId);
+
+  await page.waitForTimeout(200);
 }
 
 /**
- * Click the "Save & Complete" button.
- * Uses text= selector first (pierces shadow DOM).
- * Falls back to searching the sera-modal shadow root directly.
+ * Click "Save & Complete" using a real CDP mouse event.
+ *
+ * Why: SERA's button lives inside a sera-modal shadow root. JS .click() dispatches
+ * a synthetic DOM event which many modern frameworks (Angular, web components) ignore
+ * for form submission. We need the same path as a real user click:
+ *   1. Resolve button objectId via Runtime.evaluate (works in shadow DOM)
+ *   2. DOM.scrollIntoViewIfNeeded  →  scroll button into viewport
+ *   3. DOM.getBoxModel             →  get pixel coordinates
+ *   4. Input.dispatchMouseEvent    →  fire real mousemove + mousedown + mouseup + click
  */
 async function clickSaveAndComplete(page: SPage): Promise<void> {
-  // Primary: text= selector — Stagehand's pierce fallback handles shadow DOM
-  try {
-    const loc = page.locator("text=Save & Complete").first();
-    const visible = await loc.isVisible().catch(() => false);
-    if (visible) {
-      await loc.click();
-      return;
-    }
-  } catch {
-    // fall through
-  }
-
-  // Fallback: search sera-modal shadow root and dispatch a real click via CDP
-  const btnFound: boolean = await page.evaluate((): boolean => {
-    // Search in a root for the button
+  // Step 1: Resolve the button's remote objectId from shadow DOM
+  const objectId: string = await page.evaluate((): string => {
     const findBtn = (root: Document | ShadowRoot): HTMLElement | null => {
-      const candidates = Array.from(
-        root.querySelectorAll<HTMLElement>("button, input[type='submit'], [role='button']")
-      );
-      return (
-        candidates.find((el) => {
-          const txt = el.textContent?.trim().toLowerCase() ?? "";
-          return txt === "save & complete" || txt === "save and complete";
-        }) ?? null
-      );
+      for (const el of Array.from(root.querySelectorAll<HTMLElement>(
+        "button, input[type='submit'], [role='button']"
+      ))) {
+        const txt = el.textContent?.trim().toLowerCase() ?? "";
+        if (txt === "save & complete" || txt === "save and complete") return el;
+      }
+      return null;
     };
 
     // Try main DOM
     let btn = findBtn(document);
 
-    // Try sera-modal shadow root
+    // Try sera-modal shadow root (and one level deeper)
     if (!btn) {
-      const seraModal = document.querySelector("sera-modal");
-      if (seraModal?.shadowRoot) {
-        btn = findBtn(seraModal.shadowRoot);
-        // Also search nested shadow roots one level deep
+      const sm = document.querySelector("sera-modal");
+      if (sm?.shadowRoot) {
+        btn = findBtn(sm.shadowRoot);
         if (!btn) {
-          seraModal.shadowRoot.querySelectorAll("*").forEach((el) => {
-            if (!btn && (el as HTMLElement).shadowRoot) {
+          for (const el of Array.from(sm.shadowRoot.querySelectorAll("*"))) {
+            if ((el as HTMLElement).shadowRoot) {
               btn = findBtn((el as HTMLElement).shadowRoot!);
+              if (btn) break;
             }
-          });
+          }
         }
       }
     }
 
-    if (btn) {
-      btn.click();
-      return true;
-    }
-    return false;
+    if (!btn) return "";
+
+    // Assign a temporary __objectId trick: tag the element so Runtime.evaluate
+    // can return its remote reference. We use a data attribute as a bridge.
+    const tag = `__save_${Date.now()}`;
+    btn.setAttribute("data-sh-save", tag);
+    return tag;
   });
 
-  if (!btnFound) {
-    throw new Error("Save & Complete button not found (checked main DOM + sera-modal shadow root)");
+  if (!objectId) {
+    throw new Error("Save & Complete button not found in DOM or shadow root");
   }
+
+  // Step 2: Use Runtime.evaluate to get the actual remote objectId for the tagged element
+  const attr    = "data-sh-save";
+  const sel     = "[" + attr + "=\"" + objectId + "\"]";
+  const expr1   = "document.querySelector('" + sel + "')";
+  const resolved = await page.sendCDP<CdpResolveNode>("Runtime.evaluate", {
+    expression:    expr1,
+    returnByValue: false,
+  });
+
+  // If main DOM resolution worked
+  let remoteObjectId = resolved?.object?.objectId ?? "";
+
+  // If not found in main DOM, evaluate from shadow root
+  if (!remoteObjectId) {
+    const expr2 =
+      "(function() {" +
+      "  var sm = document.querySelector('sera-modal');" +
+      "  if (!sm || !sm.shadowRoot) return null;" +
+      "  var el = sm.shadowRoot.querySelector('" + sel + "');" +
+      "  if (el) return el;" +
+      "  var children = sm.shadowRoot.querySelectorAll('*');" +
+      "  for (var i = 0; i < children.length; i++) {" +
+      "    if (children[i].shadowRoot) {" +
+      "      var deep = children[i].shadowRoot.querySelector('" + sel + "');" +
+      "      if (deep) return deep;" +
+      "    }" +
+      "  }" +
+      "  return null;" +
+      "})()";
+    const shadowResolved = await page.sendCDP<CdpResolveNode>("Runtime.evaluate", {
+      expression:    expr2,
+      returnByValue: false,
+    });
+    remoteObjectId = shadowResolved?.object?.objectId ?? "";
+  }
+
+  if (!remoteObjectId) {
+    throw new Error("Could not resolve Save & Complete button remote objectId");
+  }
+
+  // Step 3: Scroll into view
+  try {
+    await page.sendCDP("DOM.scrollIntoViewIfNeeded", { objectId: remoteObjectId });
+    await page.waitForTimeout(200);
+  } catch { /* ignore scroll errors */ }
+
+  // Step 4: Get bounding box to find center coordinates
+  const boxResult = await page.sendCDP<CdpBoxModel>("DOM.getBoxModel", {
+    objectId: remoteObjectId,
+  });
+
+  const content = boxResult?.model?.content;
+  if (!content || content.length < 8) {
+    throw new Error("Could not get bounding box for Save & Complete button");
+  }
+
+  // content is [x1,y1, x2,y2, x3,y3, x4,y4] — top-left and bottom-right corners
+  const cx = Math.round((content[0] + content[2]) / 2);
+  const cy = Math.round((content[1] + content[5]) / 2);
+
+  // Step 5: Fire real CDP mouse events (mousemove → mousedown → mouseup)
+  await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseMoved",  x: cx, y: cy, button: "none" });
+  await page.sendCDP("Input.dispatchMouseEvent", { type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1 });
+  await page.waitForTimeout(80);
+  await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1 });
+
+  console.log(`  ℹ️  CDP mouse click fired at (${cx}, ${cy})`);
+
+  // Clean up the data attribute
+  await page.evaluate((tag: string): void => {
+    const el = document.querySelector(`[data-sh-save="${tag}"]`);
+    if (el) el.removeAttribute("data-sh-save");
+    const sm = document.querySelector("sera-modal");
+    if (sm?.shadowRoot) {
+      const sel = sm.shadowRoot.querySelector(`[data-sh-save="${tag}"]`);
+      if (sel) sel.removeAttribute("data-sh-save");
+    }
+  }, objectId).catch(() => {});
 }
 
 // =============================================================================
@@ -438,7 +490,7 @@ async function runMembershipTask(): Promise<TaskResult> {
     }
 
     // ----------------------------------------------------------------
-    // STEP 2 — Navigate to /memberships and read ALL rows ONCE
+    // STEP 2 — Navigate and read ALL rows ONCE
     // ----------------------------------------------------------------
     console.log("\n[2] → Loading /memberships …");
     await page.goto("https://misterquik.sera.tech/memberships");
@@ -463,39 +515,35 @@ async function runMembershipTask(): Promise<TaskResult> {
 
     // ----------------------------------------------------------------
     // STEP 3 — Process each row
-    // For every row: navigate fresh → click program link → fill modal → save
     // ----------------------------------------------------------------
     for (let i = 0; i < allRows.length; i++) {
       const row             = allRows[i];
       const secondDate      = calcSecondDate(row.soldOn, row.program);
       const expectedVariant = getModalVariant(row.program);
 
-      console.log(`\n[3.${i + 1}] ─────────────────────────────────────────`);
+      console.log(`\n[3.${i + 1}] ──────────────────────────────────────────`);
       console.log(`  Customer : ${row.customer}`);
       console.log(`  Program  : "${row.program}"`);
       console.log(`  Sold On  : ${row.soldOn}`);
       console.log(`  Expected : ${expectedVariant === "ends-on" ? "Ends On" : "Next Billing Date"} → ${secondDate}`);
 
-      // Navigate fresh for every row — clears any leftover modal state
+      // Fresh navigation for every row
       await page.goto("https://misterquik.sera.tech/memberships");
       await page.waitForTimeout(2000);
 
-      // Wait for table to render before clicking
-      const currentRows = await waitForTableRows(page, 8000);
-      if (currentRows.length === 0) {
-        failed.push({ ...row, message: "Table did not render after navigation" });
-        console.log("  ❌ Table not found after reload — skipping");
+      const tableRows = await waitForTableRows(page, 8000);
+      if (tableRows.length === 0) {
+        failed.push({ ...row, message: "Table empty after reload" });
+        console.log("  ❌ Table not found — skipping");
         continue;
       }
 
-      // ── 3a. Click the program link ─────────────────────────────────
-      console.log(`  → Clicking program link: "${row.program}"`);
+      // ── 3a. Click program link ─────────────────────────────────────
+      console.log(`  → Clicking: "${row.program}"`);
       const clicked = await clickProgramLink(page, row.program);
-      console.log(`  ℹ️  Click dispatched: ${clicked}`);
-
       if (!clicked) {
-        failed.push({ ...row, message: "Could not find program link in table" });
-        console.log("  ❌ Program link not found — skipping");
+        failed.push({ ...row, message: "Program link not found" });
+        console.log("  ❌ Link not found — skipping");
         continue;
       }
 
@@ -503,20 +551,20 @@ async function runMembershipTask(): Promise<TaskResult> {
       const modalOpen = await waitForModal(page, 6000);
       if (!modalOpen) {
         failed.push({ ...row, message: `Modal did not open. Session: ${sessionUrl}` });
-        console.log("  ❌ Modal did not open — skipping");
+        console.log("  ❌ Modal not opened — skipping");
         continue;
       }
-      console.log("  ✅ Modal is open");
-      await page.waitForTimeout(500); // let modal fully render
+      console.log("  ✅ Modal open");
+      await page.waitForTimeout(600); // let modal fully render
 
-      // ── 3c. Detect actual variant from live DOM ────────────────────
+      // ── 3c. Detect variant ─────────────────────────────────────────
       const actualVariant    = await detectModalVariant(page);
       const variantToUse     = actualVariant !== "unknown" ? actualVariant : expectedVariant;
       const secondFieldLabel = variantToUse === "ends-on" ? "Ends On" : "Next Billing Date";
-      console.log(`  ℹ️  Modal variant: "${secondFieldLabel}"`);
+      console.log(`  ℹ️  Variant: "${secondFieldLabel}"`);
 
       // ── 3d. Set Starts On ──────────────────────────────────────────
-      console.log(`  → "Starts On" → ${row.soldOn}`);
+      console.log(`  → Starts On → ${row.soldOn}`);
       let startsOnSet = false;
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
@@ -525,28 +573,40 @@ async function runMembershipTask(): Promise<TaskResult> {
           startsOnSet = true;
           break;
         } catch (e: unknown) {
-          console.log(`  ⚠️  Starts On attempt ${attempt}: ${e instanceof Error ? e.message : e}`);
+          console.log(`  ⚠️  Attempt ${attempt}: ${e instanceof Error ? e.message : e}`);
           await page.waitForTimeout(600);
         }
       }
-      if (!startsOnSet) console.log("  ⚠️  Starts On could not be set — continuing");
+      if (!startsOnSet) console.log("  ⚠️  Starts On not set — continuing");
 
-      // ── 3e. Set Ends On / Next Billing Date ────────────────────────
+      // ── 3e. Set second date ────────────────────────────────────────
       console.log(`  → "${secondFieldLabel}" → ${secondDate}`);
       try {
         await fillDateByLabel(page, secondFieldLabel, secondDate);
         console.log(`  ✅ "${secondFieldLabel}" set`);
       } catch (e: unknown) {
-        console.log(`  ⚠️  "${secondFieldLabel}": ${e instanceof Error ? e.message : e}`);
+        console.log(`  ⚠️  ${e instanceof Error ? e.message : e}`);
       }
 
-      // ── 3f. Save & Complete ────────────────────────────────────────
-      console.log("  → Clicking Save & Complete …");
+      // Small pause so the app processes the date changes before we click Save
+      await page.waitForTimeout(500);
+
+      // ── 3f. Click Save & Complete (real CDP mouse event) ───────────
+      console.log("  → Save & Complete (CDP mouse click) …");
       try {
         await clickSaveAndComplete(page);
-        await page.waitForTimeout(2500);
-        console.log("  ✅ Saved");
 
+        // ── 3g. VERIFY: wait for modal to close ──────────────────────
+        console.log("  → Waiting for modal to close …");
+        const saved = await waitForModalClose(page, 8000);
+
+        if (!saved) {
+          failed.push({ ...row, message: "Save & Complete clicked but modal did not close — save may have failed" });
+          console.log("  ❌ Modal still open after 8 s — marking as failed");
+          continue;
+        }
+
+        console.log("  ✅ Saved and confirmed (modal closed)");
         processed.push({
           customer: row.customer, job: row.job, program: row.program,
           soldOn: row.soldOn, startsOn: row.soldOn,
@@ -558,7 +618,7 @@ async function runMembershipTask(): Promise<TaskResult> {
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
         failed.push({ ...row, message: `Save & Complete failed: ${msg}` });
-        console.log(`  ❌ Save failed: ${msg}`);
+        console.log(`  ❌ ${msg}`);
       }
     }
 
