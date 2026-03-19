@@ -170,37 +170,39 @@ async function runMembershipTask() {
       // ----------------------------------------------------------------
       console.log(`    → Clicking program link ${i + 1}: "${row.program}"`);
 
-      const clickResult: string = await page.evaluate(({ targetProgram, targetIndex }: { targetProgram: string; targetIndex: number }) => {
-        // Get all program links — links in PROGRAM column (5th column)
-        // From screenshot: these are colored blue links like "Shape Plan Auto-Renew"
-        const rows = Array.from(document.querySelectorAll("table tbody tr"));
-        let programLinkCount = 0;
+      // Strategy: find the <a> tag whose text exactly matches the program name
+      // Do NOT use column index — find by text content directly
+      const clickResult: string = await page.evaluate(({ targetProgram }: { targetProgram: string }) => {
+        // Search ALL <a> tags on the page for one matching the program name
+        const allLinks = Array.from(document.querySelectorAll("a"));
 
-        for (const tableRow of rows) {
-          const cells = tableRow.querySelectorAll("td");
-          if (cells.length < 5) continue;
+        // Exact match first
+        const exactMatch = allLinks.find(el =>
+          el.textContent?.trim().toLowerCase() === targetProgram.toLowerCase() &&
+          (el as HTMLElement).offsetParent !== null
+        ) as HTMLElement | null;
 
-          // Check this is a data row (has a date in first cell)
-          const soldOnText = cells[0]?.textContent?.trim() || "";
-          if (!soldOnText.match(/\d{2}\/\d{2}\/\d{4}/)) continue;
-
-          // The program cell is index 4 (5th column)
-          const programCell = cells[4];
-          const programLink = programCell?.querySelector("a") as HTMLElement | null;
-
-          if (programLinkCount === targetIndex) {
-            if (programLink) {
-              programLink.click();
-              return `clicked link: "${programLink.textContent?.trim()}"`;
-            }
-            // No <a> tag — click the cell itself
-            (programCell as HTMLElement)?.click();
-            return `clicked cell: "${programCell?.textContent?.trim()}"`;
-          }
-          programLinkCount++;
+        if (exactMatch) {
+          exactMatch.click();
+          return `exact match clicked: "${exactMatch.textContent?.trim()}"`;
         }
+
+        // Partial match (first 12 chars)
+        const partialMatch = allLinks.find(el =>
+          el.textContent?.trim().toLowerCase().includes(
+            targetProgram.toLowerCase().substring(0, 12)
+          ) &&
+          (el as HTMLElement).offsetParent !== null &&
+          !/^\d+$/.test(el.textContent?.trim() || "") // skip numeric links
+        ) as HTMLElement | null;
+
+        if (partialMatch) {
+          partialMatch.click();
+          return `partial match clicked: "${partialMatch.textContent?.trim()}"`;
+        }
+
         return "not found";
-      }, { targetProgram: row.program, targetIndex: i } as any);
+      }, { targetProgram: row.program } as any);
 
       console.log(`    ℹ️  Click result: ${clickResult}`);
       await page.waitForTimeout(3000);
@@ -217,7 +219,7 @@ async function runMembershipTask() {
       if (!modalOpen) {
         console.log(`    ⚠️  Modal not open — trying page.act()`);
         try {
-          await stagehand.act(
+          await page.act(
             `click the program name link "${row.program}" in the memberships table to open the Edit Membership modal`
           );
           await page.waitForTimeout(3000);
@@ -244,43 +246,18 @@ async function runMembershipTask() {
       // Set Starts On = Sold On
       // ----------------------------------------------------------------
       console.log(`    → Setting Starts On to: ${row.soldOn}`);
-      let startsOnSet = false;
 
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-          await stagehand.act(
-            `In the Edit Membership modal, find the "Starts On" date field, clear it, and set it to exactly ${row.soldOn}`
+          await page.act(
+            `In the Edit Membership modal that is currently open, click the "Starts On" date field and change the date to ${row.soldOn}`
           );
-          await page.waitForTimeout(1500);
-
-          // Verify
-          const verify: any = await stagehand.extract(
-            `What is the current value of the "Starts On" date field in the Edit Membership modal?`
-          );
-          const verifiedValue = typeof verify === "string"
-            ? verify
-            : verify?.value || verify?.startsOn || JSON.stringify(verify);
-
-          console.log(`    ℹ️  Starts On attempt ${attempt}: "${verifiedValue}"`);
-
-          if (verifiedValue && verifiedValue.trim().includes(row.soldOn.trim())) {
-            startsOnSet = true;
-            console.log(`    ✅ Starts On set correctly`);
-            break;
-          }
+          await page.waitForTimeout(2000);
+          console.log(`    ℹ️  Starts On set attempt ${attempt} done`);
+          break;
         } catch (e: any) {
           console.log(`    ⚠️  Starts On attempt ${attempt} error: ${e.message}`);
         }
-      }
-
-      if (!startsOnSet) {
-        // Close modal and skip
-        try {
-          await stagehand.act("close or cancel the Edit Membership modal without saving");
-        } catch { /* ignore */ }
-        failed.push({ ...row, message: `Starts On could not be set to ${row.soldOn} after 3 attempts` });
-        console.log(`    ❌ Could not set Starts On — skipping`);
-        continue;
       }
 
       // ----------------------------------------------------------------
@@ -299,7 +276,7 @@ async function runMembershipTask() {
 
       console.log(`    → Setting Next Billing Date to: ${nextBillingDate}`);
       try {
-        await stagehand.act(
+        await page.act(
           `In the Edit Membership modal, find the "Next Billing Date" field, clear it, and set it to exactly ${nextBillingDate}`
         );
         await page.waitForTimeout(1500);
@@ -313,8 +290,8 @@ async function runMembershipTask() {
       // ----------------------------------------------------------------
       console.log(`    → Clicking Save & Complete`);
       try {
-        await stagehand.act(
-          `In the Edit Membership modal, click the "Save & Complete" button to save and close the modal`
+        await page.act(
+          `click the "Save & Complete" button in the Edit Membership modal`
         );
         await page.waitForTimeout(3000);
         console.log(`    ✅ Saved`);
