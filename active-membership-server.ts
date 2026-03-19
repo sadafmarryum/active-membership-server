@@ -32,17 +32,9 @@ DATE PICKER INTERACTION RULES:
 - After selection, visually re-read the field.
 - Compare Starts On vs Sold On before continuing.
 
-STEP 1: Login to Mister Quik
-1. Navigate to: https://misterquik.sera.tech/admins/login
-2. Enter email: mcc@stratablue.com
-3. Enter password: TfVKfBbnQ@12xerz9ty4
-4. Click Sign in
-5. SUCCESS CHECK: Verify dashboard is visible
-
-STEP 2: Navigate to Memberships
-1. From the left sidebar click Dispatch
-2. Click Memberships
-3. SUCCESS CHECK: Verify the "Memberships To-Do" table is visible
+IMPORTANT: You are already logged in and already on the Memberships To-Do page at
+https://misterquik.sera.tech/memberships
+DO NOT navigate to login. DO NOT click Dispatch. Start directly from Step 3 below.
 
 STEP 3: Process Memberships With Pagination Loop
 REPEAT for all pages:
@@ -135,8 +127,7 @@ async function runMembershipTask() {
     const page = stagehand.context.pages()[0];
 
     // ------------------------------------------------------------------
-    // STEP 1 — Login first (before handing off to agent)
-    // This ensures the agent starts from a logged-in state
+    // STEP 1 — Login
     // ------------------------------------------------------------------
     console.log("\n[1] → Logging in");
     await page.goto("https://misterquik.sera.tech/admins/login");
@@ -183,12 +174,35 @@ async function runMembershipTask() {
     }
 
     // ------------------------------------------------------------------
-    // STEP 2 — Hand off to AI agent for the complex membership work
-    // The agent handles: navigation, modal interactions, date pickers,
-    // date validation, pagination, Save & Complete
+    // STEP 2 — Navigate DIRECTLY to memberships page
+    // Do not rely on sidebar — go straight to the URL
     // ------------------------------------------------------------------
-    console.log("\n[2] → Starting AI agent for membership processing");
-    console.log("    ℹ️  Agent will handle all date sync and pagination");
+    console.log("\n[2] → Navigating directly to Memberships page");
+    await page.goto("https://misterquik.sera.tech/memberships");
+    await page.waitForTimeout(5000);
+
+    // Confirm page loaded correctly
+    const pageUrl: string = await page.url();
+    console.log(`    ℹ️  Current URL: ${pageUrl}`);
+
+    const pageText: string = await page.evaluate(() => {
+      return document.body.textContent?.substring(0, 200) || "";
+    });
+    console.log(`    ℹ️  Page content preview: ${pageText.replace(/\s+/g, " ").trim()}`);
+
+    // Wait for table to appear
+    try {
+      await waitUntilVisible(page, "table, tbody, .memberships-table, [class*='membership']", 15000);
+      console.log("    ✅ Memberships table is visible");
+    } catch {
+      console.log("    ⚠️  Table not found via selector — agent will handle it visually");
+    }
+
+    // ------------------------------------------------------------------
+    // STEP 3 — Hand off to AI agent for complex membership work
+    // Agent starts from the already-loaded memberships page
+    // ------------------------------------------------------------------
+    console.log("\n[3] → Starting AI agent for membership processing");
     console.log(`    🔍 Watch live: ${sessionUrl}`);
 
     const agent = stagehand.agent({
@@ -204,8 +218,8 @@ async function runMembershipTask() {
     });
 
     console.log(`\n✅ Agent completed`);
-    console.log(`   Success: ${agentResult.success}`);
-    console.log(`   Message: ${agentResult.message}`);
+    console.log(`   Success: ${agentResult?.success}`);
+    console.log(`   Message: ${agentResult?.message}`);
 
   } catch (error: any) {
     console.error(`\n❌ Task error: ${error.message}`);
