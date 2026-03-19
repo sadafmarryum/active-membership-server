@@ -1,29 +1,16 @@
 // active-membership-server.ts
 // Express server + Stagehand v3 browser automation
 //
-// ╔══════════════════════════════════════════════════════════════════╗
-// ║  ROOT CAUSE OF PREVIOUS ERRORS                                  ║
-// ║                                                                  ║
-// ║  stagehand.act() asks Gemini to find an element by returning    ║
-// ║  an elementId. When Gemini can't find the element (e.g. a       ║
-// ║  button inside a modal/shadow-DOM), it returns elementId: ""    ║
-// ║  which fails Stagehand's Zod schema → AI_NoObjectGeneratedError ║
-// ║                                                                  ║
-// ║  FIX: Use page.locator(selector).click() / .fill() for ALL      ║
-// ║  interactions — pure CDP, zero AI calls, zero schema failures.  ║
-// ║  stagehand.act() is NOT used anywhere in this file.             ║
-// ╚══════════════════════════════════════════════════════════════════╝
+// FIXES in this version:
+//   1. Program link click — waits for table to render, uses text= selector
+//      (which triggers Stagehand's shadow-DOM pierce fallback automatically)
+//   2. Save & Complete — uses text= selector so it pierces sera-modal shadow DOM
+//   3. Date fields — uses label-based DOM walk + locator.fill(), no AI
+//   4. No stagehand.act() anywhere — zero Gemini / schema validation calls
 //
-// Modal has TWO variants depending on program type:
-//   ┌─ Fixed-term plans (10-Year, 5-Year)
-//   │    Starts On  +  Ends On
-//   └─ Auto-Renew / recurring plans
-//        Starts On  +  Next Billing Date
-//
-// Logic:
-//   • Starts On         → always set to Sold On date
-//   • Ends On           → Sold On + 10 or 5 years  (fixed-term only)
-//   • Next Billing Date → Sold On + 1 year          (auto-renew only)
+// Modal variants:
+//   10-Year / 5-Year plans  →  Starts On  +  Ends On
+//   Auto-Renew / other      →  Starts On  +  Next Billing Date
 
 import { Stagehand, V3 } from "@browserbasehq/stagehand";
 import express, { Request, Response } from "express";
@@ -32,7 +19,7 @@ import express, { Request, Response } from "express";
 // TYPES
 // =============================================================================
 
-type SPage       = NonNullable<ReturnType<V3["context"]["activePage"]>>;
+type SPage        = NonNullable<ReturnType<V3["context"]["activePage"]>>;
 type ModalVariant = "ends-on" | "next-billing" | "unknown";
 
 interface MembershipRow {
@@ -76,21 +63,8 @@ interface TaskResult {
 }
 
 // =============================================================================
-// HELPERS
+// HELPERS — pure date math
 // =============================================================================
-
-function calcSecondDate(soldOn: string, programName: string): string {
-  const parts = soldOn.split("/");
-  if (parts.length !== 3) return soldOn;
-  const month = parts[0];
-  const day   = parts[1];
-  const year  = parseInt(parts[2], 10);
-  const n     = programName.toLowerCase();
-  let add = 1;
-  if (n.includes("10-year") || n.includes("10 year")) add = 10;
-  else if (n.includes("5-year") || n.includes("5 year")) add = 5;
-  return `${month}/${day}/${year + add}`;
-}
 
 function getModalVariant(programName: string): ModalVariant {
   const n = programName.toLowerCase();
@@ -99,131 +73,297 @@ function getModalVariant(programName: string): ModalVariant {
   return "next-billing";
 }
 
-/** Read the open modal DOM to confirm which second-date field is present. */
+function calcSecondDate(soldOn: string, programName: string): string {
+  const parts = soldOn.split("/");
+  if (parts.length !== 3) return soldOn;
+  const [month, day, yearStr] = parts;
+  const year = parseInt(yearStr, 10);
+  const n    = programName.toLowerCase();
+  let add = 1;
+  if (n.includes("10-year") || n.includes("10 year")) add = 10;
+  else if (n.includes("5-year") || n.includes("5 year")) add = 5;
+  return `${month}/${day}/${year + add}`;
+}
+
+// =============================================================================
+// HELPERS — page interactions (pure CDP, no AI)
+// =============================================================================
+
+/**
+ * Wait for the memberships table to appear and return all valid rows.
+ * Retries up to maxWaitMs before giving up.
+ */
+async function waitForTableRows(page: SPage, maxWaitMs = 10000): Promise<MembershipRow[]> {
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const rows: MembershipRow[] = await page.evaluate((): MembershipRow[] => {
+      const result: MembershipRow[] = [];
+      document.querySelectorAll("table tbody tr").forEach((row, idx) => {
+        const cells = row.querySelectorAll("td");
+        if (cells.length < 5) return;
+        const soldOn   = cells[0]?.textContent?.trim() ?? "";
+        const invoice  = cells[1]?.textContent?.trim() ?? "";
+        const job      = cells[2]?.textContent?.trim() ?? "";
+        const customer = cells[3]?.textContent?.trim() ?? "";
+        const program  = cells[4]?.textContent?.trim() ?? "";
+        if (!soldOn.match(/\d{2}\/\d{2}\/\d{4}/)) return;
+        if (soldOn.includes("#") || program.includes("#")) return;
+        result.push({ soldOn, invoice, job, customer, program, rowIndex: idx });
+      });
+      return result;
+    });
+    if (rows.length > 0) return rows;
+    await page.waitForTimeout(500);
+  }
+  return [];
+}
+
+/**
+ * Click a program link by its exact text.
+ * Uses the text= selector which Stagehand resolves with its pierce fallback,
+ * so it works even if the link is inside a shadow root.
+ * Returns true if the click was dispatched.
+ */
+async function clickProgramLink(page: SPage, programName: string): Promise<boolean> {
+  // Primary: text= selector (Stagehand pierces shadow DOM automatically)
+  try {
+    const loc = page.locator(`text=${programName}`).first();
+    const visible = await loc.isVisible().catch(() => false);
+    if (visible) {
+      await loc.click();
+      return true;
+    }
+  } catch {
+    // fall through
+  }
+
+  // Fallback: DOM evaluate — find <a> by text content and dispatch click
+  const clicked: boolean = await page.evaluate((target: string): boolean => {
+    const links = Array.from(document.querySelectorAll<HTMLAnchorElement>("a"));
+    const el = links.find(
+      (a) =>
+        a.textContent?.trim().toLowerCase() === target.toLowerCase() &&
+        (a as HTMLElement).offsetParent !== null
+    );
+    if (el) { el.click(); return true; }
+
+    // partial match fallback (first 12 chars)
+    const partial = links.find(
+      (a) =>
+        a.textContent?.trim().toLowerCase().startsWith(target.toLowerCase().substring(0, 12)) &&
+        (a as HTMLElement).offsetParent !== null &&
+        !/^\d+$/.test(a.textContent?.trim() ?? "")
+    );
+    if (partial) { partial.click(); return true; }
+
+    return false;
+  }, programName);
+
+  return clicked;
+}
+
+/**
+ * Wait for the Edit Memberships modal to open.
+ * Returns true when a modal is visible.
+ */
+async function waitForModal(page: SPage, timeoutMs = 5000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const open: boolean = await page.evaluate((): boolean => {
+      // Standard selectors
+      const standard = document.querySelector<HTMLElement>(
+        '.modal[style*="display: block"], .modal.show, [role="dialog"], [class*="Modal"]:not([class*="backdrop"])'
+      );
+      if (standard && standard.offsetParent !== null) return true;
+
+      // sera-modal web component — check its shadow root
+      const seraModal = document.querySelector("sera-modal");
+      if (seraModal && seraModal.shadowRoot) {
+        const inner = seraModal.shadowRoot.querySelector<HTMLElement>(".modal, [class*='modal']");
+        if (inner && inner.offsetParent !== null) return true;
+        // If shadowRoot exists and has content, the modal is open
+        if (seraModal.shadowRoot.childElementCount > 0) return true;
+      }
+
+      // Check if any h5/h4 with "Edit Memberships" text is visible
+      const headers = Array.from(document.querySelectorAll<HTMLElement>("h5, h4, h3, .modal-title"));
+      return headers.some(
+        (h) =>
+          h.textContent?.includes("Edit Memberships") &&
+          h.offsetParent !== null
+      );
+    });
+    if (open) return true;
+    await page.waitForTimeout(300);
+  }
+  return false;
+}
+
+/**
+ * Detect which second-date field the modal actually shows.
+ * Checks both regular DOM and sera-modal shadow root.
+ */
 async function detectModalVariant(page: SPage): Promise<ModalVariant> {
   return page.evaluate((): ModalVariant => {
-    const t = document.body.innerText.toLowerCase();
-    if (t.includes("ends on"))      return "ends-on";
-    if (t.includes("next billing")) return "next-billing";
+    // Check main DOM
+    const mainText = document.body.innerText.toLowerCase();
+    if (mainText.includes("ends on"))      return "ends-on";
+    if (mainText.includes("next billing")) return "next-billing";
+
+    // Check sera-modal shadow root
+    const seraModal = document.querySelector("sera-modal");
+    if (seraModal?.shadowRoot) {
+      const shadowText = seraModal.shadowRoot.textContent?.toLowerCase() ?? "";
+      if (shadowText.includes("ends on"))      return "ends-on";
+      if (shadowText.includes("next billing")) return "next-billing";
+    }
     return "unknown";
   });
 }
 
 /**
- * Fill a date input identified by its visible label.
- * Strategy:
- *   1) Find the <label> whose text matches labelText
- *   2) Use its `for` attribute (or closest input sibling) to find the input
- *   3) Triple-click to select all, then type the new date
- * Falls back to searching by placeholder/aria-label if no <label> found.
- * Pure CDP — no AI involved.
+ * Fill a date input field identified by its visible label.
+ * Searches both normal DOM and sera-modal shadow root.
+ * Uses triple-click + fill to replace the existing date.
  */
-async function fillDateByLabel(
-  page: SPage,
-  labelText: string,
-  dateValue: string
-): Promise<void> {
-  // Find the input linked to the label via DOM evaluation, then fill it
-  const selector: string = await page.evaluate((lbl: string): string => {
-    // Find label by text content (case-insensitive)
-    const labels = Array.from(document.querySelectorAll<HTMLLabelElement>("label"));
-    const label  = labels.find(
-      (el) => el.textContent?.trim().toLowerCase() === lbl.toLowerCase()
-    );
+async function fillDateByLabel(page: SPage, labelText: string, dateValue: string): Promise<void> {
+  // Assign a stable ID to the input so we can target it with a locator
+  const inputId: string = await page.evaluate(
+    (args: { label: string; id: string }): string => {
+      const { label, id } = args;
 
-    if (label) {
-      const forId = label.getAttribute("for");
-      if (forId) return `#${forId}`;
-      // Input may be a sibling or child
-      const sibling = label.nextElementSibling as HTMLElement | null;
-      if (sibling?.tagName === "INPUT") {
-        sibling.id = sibling.id || `__sh_${Math.random().toString(36).slice(2)}`;
-        return `#${sibling.id}`;
-      }
-      const child = label.querySelector<HTMLInputElement>("input");
-      if (child) {
-        child.id = child.id || `__sh_${Math.random().toString(36).slice(2)}`;
-        return `#${child.id}`;
-      }
-    }
+      // Helper: find input associated with a label element
+      const findInputForLabel = (lbl: HTMLLabelElement): HTMLInputElement | null => {
+        const forAttr = lbl.getAttribute("for");
+        if (forAttr) {
+          const el = document.getElementById(forAttr) as HTMLInputElement | null;
+          if (el) return el;
+        }
+        const sibling = lbl.nextElementSibling as HTMLInputElement | null;
+        if (sibling?.tagName === "INPUT") return sibling;
+        // Input may be wrapped in a div/span after the label
+        let next = lbl.nextElementSibling;
+        while (next) {
+          const inp = next.querySelector<HTMLInputElement>("input");
+          if (inp) return inp;
+          next = next.nextElementSibling;
+        }
+        return lbl.querySelector<HTMLInputElement>("input");
+      };
 
-    // Fallback: look for input whose preceding label text matches
-    const allInputs = Array.from(document.querySelectorAll<HTMLInputElement>("input[type='text'], input[type='date'], input:not([type])"));
-    for (const inp of allInputs) {
-      // Check aria-label
-      if (inp.getAttribute("aria-label")?.toLowerCase() === lbl.toLowerCase()) {
-        inp.id = inp.id || `__sh_${Math.random().toString(36).slice(2)}`;
-        return `#${inp.id}`;
-      }
-      // Check placeholder
-      if (inp.placeholder?.toLowerCase().includes(lbl.toLowerCase())) {
-        inp.id = inp.id || `__sh_${Math.random().toString(36).slice(2)}`;
-        return `#${inp.id}`;
-      }
-    }
+      // Search in a given root (document or shadow root)
+      const searchRoot = (root: Document | ShadowRoot): HTMLInputElement | null => {
+        const labels = Array.from(root.querySelectorAll<HTMLLabelElement>("label"));
+        const lbl = labels.find(
+          (el) => el.textContent?.trim().toLowerCase() === label.toLowerCase()
+        );
+        if (lbl) return findInputForLabel(lbl);
+        return null;
+      };
 
-    return "";
-  }, labelText);
+      // Try main DOM first
+      let inp = searchRoot(document);
 
-  if (!selector) {
+      // Try sera-modal shadow root
+      if (!inp) {
+        const seraModal = document.querySelector("sera-modal");
+        if (seraModal?.shadowRoot) {
+          inp = searchRoot(seraModal.shadowRoot);
+        }
+      }
+
+      if (!inp) return "";
+      inp.id = inp.id || id;
+      return inp.id;
+    },
+    { label: labelText, id: `__sh_${labelText.replace(/\s+/g, "_").toLowerCase()}_${Date.now()}` }
+  );
+
+  if (!inputId) {
     throw new Error(`Could not find input for label "${labelText}"`);
   }
 
-  const locator = page.locator(selector).first();
+  const loc = page.locator(`#${inputId}`).first();
 
-  // Triple-click selects all existing text, then type new value
-  await locator.click({ clickCount: 3 });
-  await page.waitForTimeout(200);
-  await locator.fill(dateValue);
+  // Triple-click selects all existing text, then fill replaces it
+  await loc.click({ clickCount: 3 });
+  await page.waitForTimeout(150);
+  await loc.fill(dateValue);
   await page.waitForTimeout(300);
+
+  // Trigger change event so the app registers the new value
+  await page.evaluate((id: string): void => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.dispatchEvent(new Event("input",  { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new Event("blur",   { bubbles: true }));
+    }
+  }, inputId);
 }
 
 /**
- * Click the "Save & Complete" button using a direct CDP locator.
- * Tries multiple selectors in order of specificity.
- * Pure CDP — no AI involved.
+ * Click the "Save & Complete" button.
+ * Uses text= selector first (pierces shadow DOM).
+ * Falls back to searching the sera-modal shadow root directly.
  */
 async function clickSaveAndComplete(page: SPage): Promise<void> {
-  // Build a prioritised list of selectors for the Save & Complete button
-  const selectors = [
-    "button:has-text('Save & Complete')",
-    "button:has-text('Save and Complete')",
-    // Generic: any visible button whose text is exactly "Save & Complete"
-    // (resolved via evaluate to get a stable ID, then click by ID)
-  ];
-
-  // Try CSS/text-based locators first
-  for (const sel of selectors) {
-    try {
-      const loc = page.locator(sel).first();
-      const visible = await loc.isVisible().catch(() => false);
-      if (visible) {
-        await loc.click();
-        return;
-      }
-    } catch {
-      // try next
+  // Primary: text= selector — Stagehand's pierce fallback handles shadow DOM
+  try {
+    const loc = page.locator("text=Save & Complete").first();
+    const visible = await loc.isVisible().catch(() => false);
+    if (visible) {
+      await loc.click();
+      return;
     }
+  } catch {
+    // fall through
   }
 
-  // Fallback: find button by text via evaluate, assign a stable ID, then click
-  const btnId: string = await page.evaluate((): string => {
-    const buttons = Array.from(document.querySelectorAll<HTMLElement>("button, input[type='submit'], [role='button']"));
-    const btn = buttons.find((el) => {
-      const txt = el.textContent?.trim().toLowerCase() ?? "";
-      return txt === "save & complete" || txt === "save and complete";
-    });
-    if (!btn) return "";
-    const id = `__save_btn_${Math.random().toString(36).slice(2)}`;
-    btn.id = id;
-    return id;
+  // Fallback: search sera-modal shadow root and dispatch a real click via CDP
+  const btnFound: boolean = await page.evaluate((): boolean => {
+    // Search in a root for the button
+    const findBtn = (root: Document | ShadowRoot): HTMLElement | null => {
+      const candidates = Array.from(
+        root.querySelectorAll<HTMLElement>("button, input[type='submit'], [role='button']")
+      );
+      return (
+        candidates.find((el) => {
+          const txt = el.textContent?.trim().toLowerCase() ?? "";
+          return txt === "save & complete" || txt === "save and complete";
+        }) ?? null
+      );
+    };
+
+    // Try main DOM
+    let btn = findBtn(document);
+
+    // Try sera-modal shadow root
+    if (!btn) {
+      const seraModal = document.querySelector("sera-modal");
+      if (seraModal?.shadowRoot) {
+        btn = findBtn(seraModal.shadowRoot);
+        // Also search nested shadow roots one level deep
+        if (!btn) {
+          seraModal.shadowRoot.querySelectorAll("*").forEach((el) => {
+            if (!btn && (el as HTMLElement).shadowRoot) {
+              btn = findBtn((el as HTMLElement).shadowRoot!);
+            }
+          });
+        }
+      }
+    }
+
+    if (btn) {
+      btn.click();
+      return true;
+    }
+    return false;
   });
 
-  if (!btnId) {
-    throw new Error("Save & Complete button not found in DOM");
+  if (!btnFound) {
+    throw new Error("Save & Complete button not found (checked main DOM + sera-modal shadow root)");
   }
-
-  await page.locator(`#${btnId}`).first().click();
 }
 
 // =============================================================================
@@ -250,13 +390,13 @@ async function runMembershipTask(): Promise<TaskResult> {
   try {
     await stagehand.init();
     sessionUrl = `https://browserbase.com/sessions/${stagehand.browserbaseSessionID}`;
-    console.log(`✅ Session started: ${sessionUrl}`);
+    console.log(`✅ Session: ${sessionUrl}`);
 
     const page: SPage = stagehand.context.activePage()!;
 
-    // ------------------------------------------------------------------
+    // ----------------------------------------------------------------
     // STEP 1 — Login
-    // ------------------------------------------------------------------
+    // ----------------------------------------------------------------
     console.log("\n[1] → Logging in …");
     await page.goto("https://misterquik.sera.tech/admins/login");
     await page.waitForTimeout(3000);
@@ -267,16 +407,14 @@ async function runMembershipTask(): Promise<TaskResult> {
 
       await page.locator('input[type="email"]').first().fill(email);
       await page.locator('input[type="password"]').first().fill(password);
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(400);
 
-      // Click the login submit button directly
       const clicked: boolean = await page.evaluate((): boolean => {
-        const keywords = ["sign in", "login", "log in"];
         const btn = Array.from(
           document.querySelectorAll<HTMLElement>('button, input[type="submit"]')
         ).find(
           (el) =>
-            keywords.some(
+            ["sign in", "login", "log in"].some(
               (kw) =>
                 el.textContent?.toLowerCase().trim() === kw ||
                 (el as HTMLInputElement).value?.toLowerCase() === kw
@@ -286,212 +424,133 @@ async function runMembershipTask(): Promise<TaskResult> {
         return false;
       });
 
-      if (!clicked) {
-        await page.locator('button[type="submit"]').first().click();
-      }
+      if (!clicked) await page.locator('button[type="submit"]').first().click();
 
       let loggedIn = false;
       for (let i = 0; i < 30; i++) {
         await page.waitForTimeout(1000);
         if (!page.url().includes("/login")) { loggedIn = true; break; }
       }
-      if (!loggedIn) throw new Error("Still on login page after 30s — check credentials");
+      if (!loggedIn) throw new Error("Still on login page after 30 s");
       console.log("    ✅ Logged in");
     } else {
       console.log("    ✅ Already logged in");
     }
 
-    // ------------------------------------------------------------------
-    // STEP 2 — Navigate to Memberships
-    // ------------------------------------------------------------------
-    console.log("\n[2] → Navigating to /memberships …");
+    // ----------------------------------------------------------------
+    // STEP 2 — Navigate to /memberships and read ALL rows ONCE
+    // ----------------------------------------------------------------
+    console.log("\n[2] → Loading /memberships …");
     await page.goto("https://misterquik.sera.tech/memberships");
-    await page.waitForTimeout(5000);
-    console.log(`    ℹ️  URL: ${page.url()}`);
+    await page.waitForTimeout(3000);
 
-    // ------------------------------------------------------------------
-    // STEP 3 — Read ALL rows before touching anything
-    // ------------------------------------------------------------------
-    console.log("\n[3] → Scanning membership table …");
-
-    const allRows: MembershipRow[] = await page.evaluate((): MembershipRow[] => {
-      const result: MembershipRow[] = [];
-      document.querySelectorAll("table tbody tr").forEach((row, idx) => {
-        const cells = row.querySelectorAll("td");
-        if (cells.length < 5) return;
-        const soldOn   = cells[0]?.textContent?.trim() ?? "";
-        const invoice  = cells[1]?.textContent?.trim() ?? "";
-        const job      = cells[2]?.textContent?.trim() ?? "";
-        const customer = cells[3]?.textContent?.trim() ?? "";
-        const program  = cells[4]?.textContent?.trim() ?? "";
-        if (!soldOn.match(/\d{2}\/\d{2}\/\d{4}/)) return;
-        if (soldOn.includes("#") || program.includes("#")) return;
-        result.push({ soldOn, invoice, job, customer, program, rowIndex: idx });
-      });
-      return result;
-    });
-
+    const allRows = await waitForTableRows(page);
     console.log(`    ℹ️  Found ${allRows.length} row(s):`);
     allRows.forEach((r, i) =>
-      console.log(`      [${i + 1}] ${r.soldOn} | ${r.customer} | ${r.program} | Job #${r.job}`)
+      console.log(`      [${i + 1}] ${r.soldOn} | ${r.customer} | "${r.program}" | Job #${r.job}`)
     );
 
     if (allRows.length === 0) {
       return {
         success: true,
         message: "No membership rows found — nothing to process.",
-        processedCount: 0,
-        failedCount: 0,
-        processed: [],
-        failed: [],
-        elapsedMinutes: parseFloat(((Date.now() - startTime) / 1000 / 60).toFixed(2)),
+        processedCount: 0, failedCount: 0,
+        processed: [], failed: [],
+        elapsedMinutes: parseFloat(((Date.now() - startTime) / 60000).toFixed(2)),
         sessionUrl,
       };
     }
 
-    // ------------------------------------------------------------------
-    // STEP 4 — Process each row
-    // ------------------------------------------------------------------
+    // ----------------------------------------------------------------
+    // STEP 3 — Process each row
+    // For every row: navigate fresh → click program link → fill modal → save
+    // ----------------------------------------------------------------
     for (let i = 0; i < allRows.length; i++) {
       const row             = allRows[i];
       const secondDate      = calcSecondDate(row.soldOn, row.program);
       const expectedVariant = getModalVariant(row.program);
 
-      console.log(`\n[4.${i + 1}] ─────────────────────────────────────────────`);
+      console.log(`\n[3.${i + 1}] ─────────────────────────────────────────`);
       console.log(`  Customer : ${row.customer}`);
-      console.log(`  Program  : ${row.program}`);
+      console.log(`  Program  : "${row.program}"`);
       console.log(`  Sold On  : ${row.soldOn}`);
       console.log(`  Expected : ${expectedVariant === "ends-on" ? "Ends On" : "Next Billing Date"} → ${secondDate}`);
 
-      // Fresh reload for every row
+      // Navigate fresh for every row — clears any leftover modal state
       await page.goto("https://misterquik.sera.tech/memberships");
-      await page.waitForTimeout(4000);
+      await page.waitForTimeout(2000);
 
-      // ----------------------------------------------------------------
-      // 4a — Click the program link via DOM (no AI)
-      // ----------------------------------------------------------------
-      console.log(`  → Clicking: "${row.program}"`);
-
-      const clickResult: string = await page.evaluate((target: string): string => {
-        const links = Array.from(document.querySelectorAll<HTMLAnchorElement>("a"));
-        const exact = links.find(
-          (el) =>
-            el.textContent?.trim().toLowerCase() === target.toLowerCase() &&
-            el.offsetParent !== null
-        );
-        if (exact) { exact.click(); return `exact: "${exact.textContent?.trim()}"`; }
-
-        const partial = links.find(
-          (el) =>
-            el.textContent?.trim().toLowerCase().startsWith(target.toLowerCase().substring(0, 12)) &&
-            el.offsetParent !== null &&
-            !/^\d+$/.test(el.textContent?.trim() ?? "")
-        );
-        if (partial) { partial.click(); return `partial: "${partial.textContent?.trim()}"`; }
-
-        return "not found";
-      }, row.program);
-
-      console.log(`  ℹ️  Click result: ${clickResult}`);
-      await page.waitForTimeout(3000);
-
-      // ----------------------------------------------------------------
-      // 4b — Confirm modal opened
-      // ----------------------------------------------------------------
-      let modalOpen: boolean = await page.evaluate((): boolean => {
-        const el = document.querySelector<HTMLElement>(
-          '.modal, [role="dialog"], [class*="modal"], [class*="Modal"], sera-modal'
-        );
-        return !!(el && el.offsetParent !== null);
-      });
-
-      if (!modalOpen) {
-        // Fallback: try clicking by button/link text via evaluate
-        console.log(`  ⚠️  Modal not detected — trying evaluate fallback …`);
-        await page.evaluate((target: string): void => {
-          const all = Array.from(document.querySelectorAll<HTMLElement>("a, button, td, span"));
-          const el = all.find(
-            (e) => e.textContent?.trim().toLowerCase().includes(target.toLowerCase().substring(0, 10)) &&
-                   e.offsetParent !== null
-          );
-          if (el) el.click();
-        }, row.program);
-        await page.waitForTimeout(3000);
-
-        modalOpen = await page.evaluate((): boolean => {
-          const el = document.querySelector<HTMLElement>(
-            '.modal, [role="dialog"], [class*="modal"], [class*="Modal"], sera-modal'
-          );
-          return !!(el && el.offsetParent !== null);
-        });
-      }
-
-      if (!modalOpen) {
-        failed.push({ ...row, message: `Modal never opened. Session: ${sessionUrl}` });
-        console.log(`  ❌ Skipping row — modal did not open`);
+      // Wait for table to render before clicking
+      const currentRows = await waitForTableRows(page, 8000);
+      if (currentRows.length === 0) {
+        failed.push({ ...row, message: "Table did not render after navigation" });
+        console.log("  ❌ Table not found after reload — skipping");
         continue;
       }
 
-      console.log(`  ✅ Modal is open`);
+      // ── 3a. Click the program link ─────────────────────────────────
+      console.log(`  → Clicking program link: "${row.program}"`);
+      const clicked = await clickProgramLink(page, row.program);
+      console.log(`  ℹ️  Click dispatched: ${clicked}`);
 
-      // ----------------------------------------------------------------
-      // 4c — Detect actual variant from live DOM
-      // ----------------------------------------------------------------
+      if (!clicked) {
+        failed.push({ ...row, message: "Could not find program link in table" });
+        console.log("  ❌ Program link not found — skipping");
+        continue;
+      }
+
+      // ── 3b. Wait for modal ─────────────────────────────────────────
+      const modalOpen = await waitForModal(page, 6000);
+      if (!modalOpen) {
+        failed.push({ ...row, message: `Modal did not open. Session: ${sessionUrl}` });
+        console.log("  ❌ Modal did not open — skipping");
+        continue;
+      }
+      console.log("  ✅ Modal is open");
+      await page.waitForTimeout(500); // let modal fully render
+
+      // ── 3c. Detect actual variant from live DOM ────────────────────
       const actualVariant    = await detectModalVariant(page);
       const variantToUse     = actualVariant !== "unknown" ? actualVariant : expectedVariant;
       const secondFieldLabel = variantToUse === "ends-on" ? "Ends On" : "Next Billing Date";
       console.log(`  ℹ️  Modal variant: "${secondFieldLabel}"`);
 
-      // ----------------------------------------------------------------
-      // 4d — Set "Starts On" = Sold On (pure CDP fill, no AI)
-      // ----------------------------------------------------------------
-      console.log(`  → Setting "Starts On" → ${row.soldOn}`);
+      // ── 3d. Set Starts On ──────────────────────────────────────────
+      console.log(`  → "Starts On" → ${row.soldOn}`);
       let startsOnSet = false;
-
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
           await fillDateByLabel(page, "Starts On", row.soldOn);
-          await page.waitForTimeout(1000);
           console.log(`  ✅ Starts On set (attempt ${attempt})`);
           startsOnSet = true;
           break;
         } catch (e: unknown) {
           console.log(`  ⚠️  Starts On attempt ${attempt}: ${e instanceof Error ? e.message : e}`);
-          await page.waitForTimeout(800);
+          await page.waitForTimeout(600);
         }
       }
+      if (!startsOnSet) console.log("  ⚠️  Starts On could not be set — continuing");
 
-      if (!startsOnSet) console.log(`  ⚠️  Could not set Starts On — proceeding anyway`);
-
-      // ----------------------------------------------------------------
-      // 4e — Set "Ends On" or "Next Billing Date" (pure CDP fill, no AI)
-      // ----------------------------------------------------------------
-      console.log(`  → Setting "${secondFieldLabel}" → ${secondDate}`);
+      // ── 3e. Set Ends On / Next Billing Date ────────────────────────
+      console.log(`  → "${secondFieldLabel}" → ${secondDate}`);
       try {
         await fillDateByLabel(page, secondFieldLabel, secondDate);
-        await page.waitForTimeout(1000);
         console.log(`  ✅ "${secondFieldLabel}" set`);
       } catch (e: unknown) {
-        console.log(`  ⚠️  "${secondFieldLabel}" error: ${e instanceof Error ? e.message : e}`);
+        console.log(`  ⚠️  "${secondFieldLabel}": ${e instanceof Error ? e.message : e}`);
       }
 
-      // ----------------------------------------------------------------
-      // 4f — Click "Save & Complete" (pure CDP click, no AI)
-      // ----------------------------------------------------------------
-      console.log(`  → Clicking "Save & Complete" …`);
+      // ── 3f. Save & Complete ────────────────────────────────────────
+      console.log("  → Clicking Save & Complete …");
       try {
         await clickSaveAndComplete(page);
-        await page.waitForTimeout(3000);
-        console.log(`  ✅ Saved`);
+        await page.waitForTimeout(2500);
+        console.log("  ✅ Saved");
 
         processed.push({
-          customer:        row.customer,
-          job:             row.job,
-          program:         row.program,
-          soldOn:          row.soldOn,
-          startsOn:        row.soldOn,
-          secondDateField: secondFieldLabel,
-          secondDateValue: secondDate,
+          customer: row.customer, job: row.job, program: row.program,
+          soldOn: row.soldOn, startsOn: row.soldOn,
+          secondDateField: secondFieldLabel, secondDateValue: secondDate,
           message:
             `${row.customer} | Job #${row.job} | ${row.program}` +
             ` | Starts On: ${row.soldOn} | ${secondFieldLabel}: ${secondDate}`,
@@ -505,17 +564,14 @@ async function runMembershipTask(): Promise<TaskResult> {
 
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
-    console.error(`\n❌ Fatal error: ${msg}`);
+    console.error(`\n❌ Fatal: ${msg}`);
     failed.push({ message: `Fatal: ${msg}` });
   } finally {
     await stagehand.close();
-    console.log("\n🔒 Browser session closed");
+    console.log("\n🔒 Session closed");
   }
 
-  // ------------------------------------------------------------------
-  // Build final response
-  // ------------------------------------------------------------------
-  const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(2);
+  const elapsed = ((Date.now() - startTime) / 60000).toFixed(2);
   const success = failed.length === 0;
 
   let message: string;
@@ -534,16 +590,12 @@ async function runMembershipTask(): Promise<TaskResult> {
     message = lines.join("\n");
   }
 
-  console.log(`\n📋 Summary:\n${message}`);
-  console.log(`⏱  Elapsed: ${elapsed} min`);
+  console.log(`\n📋 Summary:\n${message}\n⏱  ${elapsed} min`);
 
   return {
-    success,
-    message,
-    processedCount: processed.length,
-    failedCount:    failed.length,
-    processed,
-    failed,
+    success, message,
+    processedCount: processed.length, failedCount: failed.length,
+    processed, failed,
     elapsedMinutes: parseFloat(elapsed),
     sessionUrl,
   };
@@ -561,7 +613,7 @@ app.get("/health", (_req: Request, res: Response): void => {
 });
 
 app.post("/run-membership-fix", async (_req: Request, res: Response): Promise<void> => {
-  console.log(`\n📥 [${new Date().toISOString()}] POST /run-membership-fix received`);
+  console.log(`\n📥 [${new Date().toISOString()}] POST /run-membership-fix`);
   try {
     const result = await runMembershipTask();
     res.json(result);
@@ -573,7 +625,7 @@ app.post("/run-membership-fix", async (_req: Request, res: Response): Promise<vo
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 app.listen(PORT, () => {
-  console.log(`\n🚀 Active Membership Server running on port ${PORT}`);
+  console.log(`\n🚀 Active Membership Server on port ${PORT}`);
   console.log(`   POST /run-membership-fix  ← n8n trigger`);
   console.log(`   GET  /health              ← Render health check\n`);
 });
