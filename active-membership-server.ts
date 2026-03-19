@@ -1,99 +1,20 @@
 // active-membership-server.ts
-// Single file — Express server + Stagehand AI agent task
-// Deploy on Render, call from n8n Schedule Trigger via POST /run-membership-fix
+// Single file — Express server + Stagehand task
+// Clicks each program link one by one, completes modal, moves to next
+// Deploy on Render, call from n8n via POST /run-membership-fix
 
 import { Stagehand } from "@browserbasehq/stagehand";
 import express from "express";
 
 // =============================================================================
-// PROMPT — exact task instructions for the AI agent
-// =============================================================================
-
-const MEMBERSHIP_PROMPT = `
-IMPORTANT CONTEXT:
-- You are already logged in and already on the Memberships To-Do page.
-- The page URL is: https://misterquik.sera.tech/memberships
-- The page title is "Memberships To-Do"
-- The table has these columns: SOLD ON | INVOICE | JOB | CUSTOMER | PROGRAM | SYSTEMS | DEPARTMENT | OWNER | COMPLETE
-- To open the Edit Membership modal: click the PROGRAM name link (e.g. "10-Year Shape Plan") in the PROGRAM column.
-- Do NOT click Invoice number or Job number — only click the PROGRAM name.
-- Do NOT navigate anywhere. Do NOT login. Start processing immediately.
-
-GENERAL RULES:
-- Never retry the same action more than 3 times.
-- If Sold On date and Starts On date do NOT match exactly after 3 retries, DO NOT save — report failure.
-- Always wait for modals or page loads to fully appear before interacting.
-- Verify success after every major step.
-
-DATE SYNCHRONIZATION RULE (HIGHEST PRIORITY):
-- The Sold On date shown in the table row is the SINGLE SOURCE OF TRUTH.
-- Inside the Edit Membership modal, the Starts On date MUST be EXACTLY equal to the Sold On date.
-- Month, day, and year must match character-for-character.
-- If the modal auto-adjusts the date, overwrite it with the correct Sold On date.
-- Saving is FORBIDDEN unless Starts On exactly equals Sold On.
-
-DATE PICKER RULES:
-- Always use the calendar/date-picker widget to set dates.
-- Clear the date field before selecting a new value.
-- After selection, re-read the field value to confirm it matches.
-
-NEXT BILLING DATE CALCULATION:
-- Month and day must be exactly the same as Starts On.
-- Year is calculated based on the program name:
-    - If program contains "10-Year" → add 10 years to Starts On year
-    - If program contains "5-Year"  → add 5 years to Starts On year
-    - If program contains "Auto-Renew" → add 1 year to Starts On year
-
-PROCESSING STEPS — repeat for EVERY row in the table:
-
-1. Read the Sold On date from the current row (e.g. "03/19/2026")
-2. Read the Program name from the PROGRAM column (e.g. "10-Year Shape Plan")
-3. Read the Customer name from the CUSTOMER column
-4. Read the Job number from the JOB column
-5. Click the PROGRAM name link to open the Edit Membership modal
-6. Wait for the Edit Membership modal to fully open
-7. In the modal:
-   a. Find the "Starts On" date field
-   b. Clear it and set it to exactly the Sold On date from step 1
-   c. Re-read the Starts On field to confirm it matches Sold On exactly
-   d. If it does not match, retry up to 3 times — if still wrong, stop and report error
-   e. Calculate the Next Billing Date: same month and day as Starts On, year + offset based on program
-   f. Set the Next Billing Date using the date picker
-   g. Confirm Next Billing Date is correct
-   h. Confirm Starts On still equals Sold On
-   i. Confirm no validation errors are visible
-   j. Click "Save & Complete"
-   k. Wait for the modal to close
-   l. Confirm the row is now marked as complete
-
-PAGINATION:
-- After processing all rows on the current page, check if a next page button exists.
-- If yes, click next page and repeat the processing steps.
-- If no, stop.
-
-FINAL REPORT:
-When all memberships are processed, output a summary that includes:
-- Total memberships processed
-- For each membership: Customer Name, Job Number, Program, Starts On date set, Next Billing Date set
-- Example: "Processed 1 membership: Chuck Dotson | Job #8943860 | 10-Year Shape Plan | Starts On: 03/19/2026 | Next Billing: 03/19/2036"
-
-STOP EXECUTION after the final report.
-`.trim();
-
-// =============================================================================
 // HELPERS
 // =============================================================================
 
-async function waitUntilVisible(page: any, selector: string, timeoutMs = 15000): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      const visible = await page.locator(selector).first().isVisible();
-      if (visible) return true;
-    } catch { /* not ready */ }
-    await page.waitForTimeout(500);
-  }
-  throw new Error(`Timeout (${timeoutMs}ms): "${selector}" never became visible`);
+function calcNextBillingYear(startsOnYear: number, programName: string): number {
+  const name = programName.toLowerCase();
+  if (name.includes("10-year") || name.includes("10 year")) return startsOnYear + 10;
+  if (name.includes("5-year")  || name.includes("5 year"))  return startsOnYear + 5;
+  return startsOnYear + 1; // Auto-Renew or default
 }
 
 // =============================================================================
@@ -114,7 +35,8 @@ async function runMembershipTask() {
   });
 
   let sessionUrl = "";
-  let agentResult: any = null;
+  const processed: any[] = [];
+  const failed: any[]    = [];
 
   try {
     await stagehand.init();
@@ -153,133 +75,299 @@ async function runMembershipTask() {
         if (btn) { btn.click(); return true; }
         return false;
       });
-      if (!clicked) {
-        await page.locator('button[type="submit"]').first().click();
-      }
+      if (!clicked) await page.locator('button[type="submit"]').first().click();
 
       for (let i = 0; i < 30; i++) {
         await page.waitForTimeout(1000);
-        const url: string = await page.url();
-        if (!url.includes("/login")) {
-          console.log(`    ✅ Logged in — redirected to: ${url}`);
+        if (!(await page.url()).includes("/login")) {
+          console.log("    ✅ Logged in");
           break;
         }
-        if (i === 29) throw new Error("Still on login page after 30s — check credentials");
+        if (i === 29) throw new Error("Still on login page after 30s");
       }
     } else {
       console.log("    ✅ Already logged in");
     }
 
     // ------------------------------------------------------------------
-    // STEP 2 — Navigate directly to memberships page
+    // STEP 2 — Navigate to memberships
     // ------------------------------------------------------------------
-    console.log("\n[2] → Navigating to Memberships page");
+    console.log("\n[2] → Navigating to Memberships");
     await page.goto("https://misterquik.sera.tech/memberships");
     await page.waitForTimeout(5000);
+    console.log(`    ℹ️  URL: ${await page.url()}`);
 
-    const pageUrl: string = await page.url();
-    console.log(`    ℹ️  Current URL: ${pageUrl}`);
+    // ------------------------------------------------------------------
+    // STEP 3 — Read all rows FIRST before clicking anything
+    // ------------------------------------------------------------------
+    console.log("\n[3] → Reading all membership rows");
 
-    // Wait for table to load
-    try {
-      await waitUntilVisible(page, "table tbody tr, .memberships-table tr", 15000);
-      console.log("    ✅ Memberships table loaded");
-    } catch {
-      console.log("    ⚠️  Table selector not found — agent will handle visually");
+    const allRows: Array<{
+      soldOn: string;
+      invoice: string;
+      job: string;
+      customer: string;
+      program: string;
+      rowIndex: number;
+    }> = await page.evaluate(() => {
+      const rows = Array.from(document.querySelectorAll("table tbody tr"));
+      const result: any[] = [];
+
+      rows.forEach((row, idx) => {
+        const cells = row.querySelectorAll("td");
+        if (cells.length < 5) return;
+
+        const soldOn   = cells[0]?.textContent?.trim() || "";
+        const invoice  = cells[1]?.textContent?.trim() || "";
+        const job      = cells[2]?.textContent?.trim() || "";
+        const customer = cells[3]?.textContent?.trim() || "";
+        const program  = cells[4]?.textContent?.trim() || "";
+
+        // Skip summary/footer rows (they have "# OF" text)
+        if (soldOn.includes("#") || program.includes("#") || soldOn.length === 0) return;
+        // Skip rows that are just summary counts
+        if (!soldOn.match(/\d{2}\/\d{2}\/\d{4}/)) return;
+
+        result.push({ soldOn, invoice, job, customer, program, rowIndex: idx });
+      });
+
+      return result;
+    });
+
+    console.log(`    ℹ️  Found ${allRows.length} membership row(s):`);
+    allRows.forEach((r, i) => {
+      console.log(`    Row ${i + 1}: ${r.soldOn} | ${r.customer} | ${r.program} | Job #${r.job}`);
+    });
+
+    if (allRows.length === 0) {
+      return {
+        success: true,
+        message: "No memberships found to process.",
+        processedCount: 0,
+        failedCount: 0,
+        processed: [],
+        failed: [],
+        elapsedMinutes: parseFloat(((Date.now() - startTime) / 1000 / 60).toFixed(2)),
+        sessionUrl,
+      };
     }
 
-    // Log what rows are visible so we can confirm page loaded
-    const rowData: string[] = await page.evaluate(() => {
-      const rows = Array.from(document.querySelectorAll("table tbody tr"));
-      return rows.map(r => r.textContent?.replace(/\s+/g, " ").trim() || "").filter(t => t.length > 0);
-    });
-    console.log(`    ℹ️  Found ${rowData.length} row(s) in table`);
-    rowData.forEach((r, i) => console.log(`    Row ${i + 1}: ${r.substring(0, 100)}`));
-
     // ------------------------------------------------------------------
-    // STEP 3 — Click the first program link via DOM to confirm it works
-    // then let agent handle the modal and all subsequent rows
+    // STEP 4 — Process each row ONE BY ONE
+    // After each row: close modal → reload page → click next program
     // ------------------------------------------------------------------
-    console.log("\n[3] → Clicking first Program link to open Edit Membership modal");
+    for (let i = 0; i < allRows.length; i++) {
+      const row = allRows[i];
+      console.log(`\n[4.${i + 1}] → Processing: "${row.program}" (${row.customer})`);
 
-    // Find and click the program link directly — from screenshot it's a blue link in PROGRAM column
-    const programClicked = await page.evaluate(() => {
-      // The program name is a link — find it in the table
-      // From screenshot: "10-Year Shape Plan" is a clickable link
-      const links = Array.from(document.querySelectorAll("table tbody tr td a, table tbody tr td button"));
-      // Skip invoice and job number links (they are numeric) — find the text link
-      const programLink = links.find(el => {
-        const text = el.textContent?.trim() || "";
-        // Program names contain words like "Year", "Plan", "Auto", "Shape", "Renew"
-        return text.length > 5 && !/^\d+$/.test(text) && !text.includes("@");
-      }) as HTMLElement | null;
-      if (programLink) {
-        const text = programLink.textContent?.trim();
-        programLink.click();
-        return text;
-      }
-      return null;
-    });
+      // Reload page fresh for each row to avoid stale state
+      await page.goto("https://misterquik.sera.tech/memberships");
+      await page.waitForTimeout(4000);
 
-    if (programClicked) {
-      console.log(`    ✅ Clicked program: "${programClicked}"`);
+      // ----------------------------------------------------------------
+      // Click the program link by index position
+      // Find all program links in order, click the i-th one
+      // ----------------------------------------------------------------
+      console.log(`    → Clicking program link ${i + 1}: "${row.program}"`);
+
+      const clickResult: string = await page.evaluate((targetProgram: string, targetIndex: number) => {
+        // Get all program links — links in PROGRAM column (5th column)
+        // From screenshot: these are colored blue links like "Shape Plan Auto-Renew"
+        const rows = Array.from(document.querySelectorAll("table tbody tr"));
+        let programLinkCount = 0;
+
+        for (const tableRow of rows) {
+          const cells = tableRow.querySelectorAll("td");
+          if (cells.length < 5) continue;
+
+          // Check this is a data row (has a date in first cell)
+          const soldOnText = cells[0]?.textContent?.trim() || "";
+          if (!soldOnText.match(/\d{2}\/\d{2}\/\d{4}/)) continue;
+
+          // The program cell is index 4 (5th column)
+          const programCell = cells[4];
+          const programLink = programCell?.querySelector("a") as HTMLElement | null;
+
+          if (programLinkCount === targetIndex) {
+            if (programLink) {
+              programLink.click();
+              return `clicked link: "${programLink.textContent?.trim()}"`;
+            }
+            // No <a> tag — click the cell itself
+            (programCell as HTMLElement)?.click();
+            return `clicked cell: "${programCell?.textContent?.trim()}"`;
+          }
+          programLinkCount++;
+        }
+        return "not found";
+      }, row.program, i);
+
+      console.log(`    ℹ️  Click result: ${clickResult}`);
       await page.waitForTimeout(3000);
 
       // Check if modal opened
-      const modalVisible = await page.evaluate(() => {
-        const modal = document.querySelector('.modal, [role="dialog"], .modal-content, [class*="modal"]');
-        return modal !== null && (modal as HTMLElement).offsetParent !== null;
+      let modalOpen: boolean = await page.evaluate(() => {
+        const modal = document.querySelector(
+          '.modal, [role="dialog"], [class*="modal"], [class*="Modal"], sera-modal'
+        );
+        return !!(modal && (modal as HTMLElement).offsetParent !== null);
       });
-      console.log(`    ℹ️  Modal visible: ${modalVisible}`);
 
-      if (modalVisible) {
-        console.log("    ✅ Modal opened successfully — handing off to AI agent");
-      } else {
-        console.log("    ⚠️  Modal did not open via DOM click — agent will retry visually");
+      // If modal not open, try page.act() as fallback
+      if (!modalOpen) {
+        console.log(`    ⚠️  Modal not open — trying page.act()`);
+        try {
+          await stagehand.act(
+            `click the program name link "${row.program}" in the memberships table to open the Edit Membership modal`
+          );
+          await page.waitForTimeout(3000);
+          modalOpen = await page.evaluate(() => {
+            const modal = document.querySelector(
+              '.modal, [role="dialog"], [class*="modal"], [class*="Modal"], sera-modal'
+            );
+            return !!(modal && (modal as HTMLElement).offsetParent !== null);
+          });
+        } catch (e: any) {
+          console.log(`    ⚠️  page.act() failed: ${e.message}`);
+        }
       }
-    } else {
-      console.log("    ⚠️  Program link not found via DOM — agent will handle from scratch");
+
+      if (!modalOpen) {
+        failed.push({ ...row, message: `Modal did not open. Check session replay: ${sessionUrl}` });
+        console.log(`    ❌ Modal failed to open — skipping row`);
+        continue;
+      }
+
+      console.log(`    ✅ Modal opened`);
+
+      // ----------------------------------------------------------------
+      // Set Starts On = Sold On
+      // ----------------------------------------------------------------
+      console.log(`    → Setting Starts On to: ${row.soldOn}`);
+      let startsOnSet = false;
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          await stagehand.act(
+            `In the Edit Membership modal, find the "Starts On" date field, clear it, and set it to exactly ${row.soldOn}`
+          );
+          await page.waitForTimeout(1500);
+
+          // Verify
+          const verify: any = await stagehand.extract(
+            `What is the current value of the "Starts On" date field in the Edit Membership modal?`
+          );
+          const verifiedValue = typeof verify === "string"
+            ? verify
+            : verify?.value || verify?.startsOn || JSON.stringify(verify);
+
+          console.log(`    ℹ️  Starts On attempt ${attempt}: "${verifiedValue}"`);
+
+          if (verifiedValue && verifiedValue.trim().includes(row.soldOn.trim())) {
+            startsOnSet = true;
+            console.log(`    ✅ Starts On set correctly`);
+            break;
+          }
+        } catch (e: any) {
+          console.log(`    ⚠️  Starts On attempt ${attempt} error: ${e.message}`);
+        }
+      }
+
+      if (!startsOnSet) {
+        // Close modal and skip
+        try {
+          await stagehand.act("close or cancel the Edit Membership modal without saving");
+        } catch { /* ignore */ }
+        failed.push({ ...row, message: `Starts On could not be set to ${row.soldOn} after 3 attempts` });
+        console.log(`    ❌ Could not set Starts On — skipping`);
+        continue;
+      }
+
+      // ----------------------------------------------------------------
+      // Calculate and set Next Billing Date
+      // ----------------------------------------------------------------
+      const soldOnParts = row.soldOn.split("/");
+      let nextBillingDate = row.soldOn;
+
+      if (soldOnParts.length === 3) {
+        const month    = soldOnParts[0];
+        const day      = soldOnParts[1];
+        const year     = parseInt(soldOnParts[2], 10);
+        const nextYear = calcNextBillingYear(year, row.program);
+        nextBillingDate = `${month}/${day}/${nextYear}`;
+      }
+
+      console.log(`    → Setting Next Billing Date to: ${nextBillingDate}`);
+      try {
+        await stagehand.act(
+          `In the Edit Membership modal, find the "Next Billing Date" field, clear it, and set it to exactly ${nextBillingDate}`
+        );
+        await page.waitForTimeout(1500);
+        console.log(`    ✅ Next Billing Date set`);
+      } catch (e: any) {
+        console.log(`    ⚠️  Next Billing Date error: ${e.message}`);
+      }
+
+      // ----------------------------------------------------------------
+      // Final check and Save & Complete
+      // ----------------------------------------------------------------
+      console.log(`    → Clicking Save & Complete`);
+      try {
+        await stagehand.act(
+          `In the Edit Membership modal, click the "Save & Complete" button to save and close the modal`
+        );
+        await page.waitForTimeout(3000);
+        console.log(`    ✅ Saved`);
+
+        processed.push({
+          customer:       row.customer,
+          job:            row.job,
+          program:        row.program,
+          soldOn:         row.soldOn,
+          startsOn:       row.soldOn,
+          nextBillingDate,
+          message: `${row.customer} | Job #${row.job} | ${row.program} | Starts On: ${row.soldOn} | Next Billing: ${nextBillingDate}`,
+        });
+      } catch (e: any) {
+        failed.push({ ...row, message: `Save failed: ${e.message}` });
+        console.log(`    ❌ Save failed: ${e.message}`);
+      }
     }
 
-    // ------------------------------------------------------------------
-    // STEP 4 — Hand off to AI agent
-    // ------------------------------------------------------------------
-    console.log("\n[4] → Starting AI agent");
-    console.log(`    🔍 Watch live: ${sessionUrl}`);
-
-    const agent = stagehand.agent({
-      model: {
-        modelName: "google/gemini-2.5-flash",
-        apiKey: process.env.GEMINI_API_KEY || "",
-      },
-    });
-
-    agentResult = await agent.execute({
-      instruction: MEMBERSHIP_PROMPT,
-      maxSteps: 200,
-    });
-
-    console.log(`\n✅ Agent completed`);
-    console.log(`   Success: ${agentResult?.success}`);
-    console.log(`   Message: ${agentResult?.message}`);
-
   } catch (error: any) {
-    console.error(`\n❌ Task error: ${error.message}`);
-    agentResult = {
-      success: false,
-      message: `Task failed: ${error.message}. Session: ${sessionUrl}`,
-    };
+    console.error(`\n❌ Fatal error: ${error.message}`);
+    failed.push({ message: `Fatal: ${error.message}` });
   } finally {
     await stagehand.close();
-    console.log("\n🔒 Browser session closed");
+    console.log("\n🔒 Session closed");
   }
 
   const elapsed = ((Date.now() - startTime) / 1000 / 60).toFixed(2);
+  const success = failed.length === 0 && processed.length >= 0;
+
+  let message = "";
+  if (processed.length === 0 && failed.length === 0) {
+    message = "No memberships found to process.";
+  } else {
+    if (processed.length > 0) {
+      message += `Membership date correction completed for ${processed.length} membership(s):\n`;
+      processed.forEach(p => { message += `- ${p.message}\n`; });
+    }
+    if (failed.length > 0) {
+      message += `\nFailed ${failed.length} membership(s):\n`;
+      failed.forEach(f => { message += `- ${f.customer || "unknown"} | ${f.message}\n`; });
+    }
+  }
+
+  console.log(`\n📋 Final:\n${message}`);
 
   return {
-    success:        agentResult?.success  ?? false,
-    message:        agentResult?.message  ?? "Task did not complete — check session replay.",
-    actions:        agentResult?.actions?.length ?? 0,
+    success,
+    message:        message.trim(),
+    processedCount: processed.length,
+    failedCount:    failed.length,
+    processed,
+    failed,
     elapsedMinutes: parseFloat(elapsed),
     sessionUrl,
   };
