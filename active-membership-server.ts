@@ -170,7 +170,7 @@ async function runMembershipTask() {
       // ----------------------------------------------------------------
       console.log(`    → Clicking program link ${i + 1}: "${row.program}"`);
 
-      const clickResult: string = await page.evaluate((targetProgram: string, targetIndex: number) => {
+      const clickResult: string = await page.evaluate(({ targetProgram, targetIndex }: { targetProgram: string; targetIndex: number }) => {
         // Get all program links — links in PROGRAM column (5th column)
         // From screenshot: these are colored blue links like "Shape Plan Auto-Renew"
         const rows = Array.from(document.querySelectorAll("table tbody tr"));
@@ -200,7 +200,7 @@ async function runMembershipTask() {
           programLinkCount++;
         }
         return "not found";
-      }, row.program, i);
+      }, { targetProgram: row.program, targetIndex: i } as any);
 
       console.log(`    ℹ️  Click result: ${clickResult}`);
       await page.waitForTimeout(3000);
