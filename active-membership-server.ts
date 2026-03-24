@@ -1,137 +1,80 @@
 // active-membership-server.ts
 // Express server + Stagehand v3 browser automation
 //
-// KEY FIX in this version:
-//   "Save & Complete" now uses a real CDP mouse click (scroll into view →
-//   get bounding box → Input.dispatchMouseEvent) instead of a JS .click()
-//   DOM event. This is required because SERA's button is inside a sera-modal
-//   web component shadow root and only responds to real pointer events.
-//
-//   After clicking Save, we verify success by waiting for the modal to close.
-//
-// Modal variants:
-//   10-Year / 5-Year plans  →  Starts On  +  Ends On
-//   Auto-Renew / other      →  Starts On  +  Next Billing Date
+// APPROACH:
+//  - Navigation + modal open: pure CDP (fast, reliable)
+//  - Date fields: CDP keyboard typing (ctrl+a → type → tab)
+//  - Save & Complete: stagehand.act() with a very precise instruction
+//    (act() works fine when the modal IS open and rendered — previous failures
+//     were because the button wasn't visible yet, not because act() is broken)
+//  - Success verification: wait for modal to close after save
 
 import { Stagehand, V3 } from "@browserbasehq/stagehand";
 import express, { Request, Response } from "express";
-
-// =============================================================================
-// TYPES
-// =============================================================================
 
 type SPage        = NonNullable<ReturnType<V3["context"]["activePage"]>>;
 type ModalVariant = "ends-on" | "next-billing" | "unknown";
 
 interface MembershipRow {
-  soldOn: string;
-  invoice: string;
-  job: string;
-  customer: string;
-  program: string;
-  rowIndex: number;
+  soldOn: string; invoice: string; job: string;
+  customer: string; program: string; rowIndex: number;
 }
-
 interface ProcessedEntry {
-  customer: string;
-  job: string;
-  program: string;
-  soldOn: string;
-  startsOn: string;
-  secondDateField: string;
-  secondDateValue: string;
-  message: string;
+  customer: string; job: string; program: string;
+  soldOn: string; startsOn: string;
+  secondDateField: string; secondDateValue: string; message: string;
 }
-
 interface FailedEntry {
-  customer?: string;
-  job?: string;
-  program?: string;
-  soldOn?: string;
-  rowIndex?: number;
-  message: string;
+  customer?: string; job?: string; program?: string;
+  soldOn?: string; rowIndex?: number; message: string;
 }
-
 interface TaskResult {
-  success: boolean;
-  message: string;
-  processedCount: number;
-  failedCount: number;
-  processed: ProcessedEntry[];
-  failed: FailedEntry[];
-  elapsedMinutes: number;
-  sessionUrl: string;
-}
-
-// CDP types for box model response
-interface CdpBoxModel {
-  model: {
-    content: number[];
-    padding: number[];
-    border: number[];
-    margin: number[];
-    width: number;
-    height: number;
-  };
-}
-
-interface CdpResolveNode {
-  object: { objectId: string };
-}
-
-interface CdpRequestNode {
-  nodeId: number;
-}
-
-interface CdpDescribeNode {
-  node: { backendNodeId: number };
+  success: boolean; message: string;
+  processedCount: number; failedCount: number;
+  processed: ProcessedEntry[]; failed: FailedEntry[];
+  elapsedMinutes: number; sessionUrl: string;
 }
 
 // =============================================================================
-// DATE HELPERS
+// HELPERS
 // =============================================================================
 
-function getModalVariant(programName: string): ModalVariant {
-  const n = programName.toLowerCase();
+function getModalVariant(p: string): ModalVariant {
+  const n = p.toLowerCase();
   if (n.includes("10-year") || n.includes("10 year")) return "ends-on";
   if (n.includes("5-year")  || n.includes("5 year"))  return "ends-on";
   return "next-billing";
 }
 
-function calcSecondDate(soldOn: string, programName: string): string {
-  const parts = soldOn.split("/");
-  if (parts.length !== 3) return soldOn;
-  const [month, day, yearStr] = parts;
-  const year = parseInt(yearStr, 10);
-  const n    = programName.toLowerCase();
+function calcSecondDate(soldOn: string, program: string): string {
+  const [m, d, y] = soldOn.split("/");
+  if (!m || !d || !y) return soldOn;
+  const n = program.toLowerCase();
   let add = 1;
   if (n.includes("10-year") || n.includes("10 year")) add = 10;
   else if (n.includes("5-year") || n.includes("5 year")) add = 5;
-  return `${month}/${day}/${year + add}`;
+  return `${m}/${d}/${parseInt(y, 10) + add}`;
 }
 
-// =============================================================================
-// PAGE HELPERS
-// =============================================================================
-
-async function waitForTableRows(page: SPage, maxWaitMs = 10000): Promise<MembershipRow[]> {
-  const deadline = Date.now() + maxWaitMs;
-  while (Date.now() < deadline) {
+async function waitForRows(page: SPage, ms = 10000): Promise<MembershipRow[]> {
+  const t = Date.now() + ms;
+  while (Date.now() < t) {
     const rows: MembershipRow[] = await page.evaluate((): MembershipRow[] => {
-      const result: MembershipRow[] = [];
-      document.querySelectorAll("table tbody tr").forEach((row, idx) => {
-        const cells = row.querySelectorAll("td");
-        if (cells.length < 5) return;
-        const soldOn   = cells[0]?.textContent?.trim() ?? "";
-        const invoice  = cells[1]?.textContent?.trim() ?? "";
-        const job      = cells[2]?.textContent?.trim() ?? "";
-        const customer = cells[3]?.textContent?.trim() ?? "";
-        const program  = cells[4]?.textContent?.trim() ?? "";
+      const out: MembershipRow[] = [];
+      document.querySelectorAll("table tbody tr").forEach((r, i) => {
+        const c = r.querySelectorAll("td");
+        if (c.length < 5) return;
+        const soldOn = c[0]?.textContent?.trim() ?? "";
         if (!soldOn.match(/\d{2}\/\d{2}\/\d{4}/)) return;
-        if (soldOn.includes("#") || program.includes("#")) return;
-        result.push({ soldOn, invoice, job, customer, program, rowIndex: idx });
+        out.push({
+          soldOn, invoice: c[1]?.textContent?.trim() ?? "",
+          job: c[2]?.textContent?.trim() ?? "",
+          customer: c[3]?.textContent?.trim() ?? "",
+          program: c[4]?.textContent?.trim() ?? "",
+          rowIndex: i,
+        });
       });
-      return result;
+      return out;
     });
     if (rows.length > 0) return rows;
     await page.waitForTimeout(500);
@@ -139,44 +82,15 @@ async function waitForTableRows(page: SPage, maxWaitMs = 10000): Promise<Members
   return [];
 }
 
-async function clickProgramLink(page: SPage, programName: string): Promise<boolean> {
-  // Primary: text= selector (triggers Stagehand shadow-DOM pierce fallback)
-  try {
-    const loc = page.locator(`text=${programName}`).first();
-    const visible = await loc.isVisible().catch(() => false);
-    if (visible) { await loc.click(); return true; }
-  } catch { /* fall through */ }
-
-  // Fallback: DOM evaluate
-  return page.evaluate((target: string): boolean => {
-    const links = Array.from(document.querySelectorAll<HTMLAnchorElement>("a"));
-    const exact = links.find(
-      (a) => a.textContent?.trim().toLowerCase() === target.toLowerCase() && a.offsetParent !== null
-    );
-    if (exact) { exact.click(); return true; }
-    const partial = links.find(
-      (a) =>
-        a.textContent?.trim().toLowerCase().startsWith(target.toLowerCase().substring(0, 12)) &&
-        a.offsetParent !== null && !/^\d+$/.test(a.textContent?.trim() ?? "")
-    );
-    if (partial) { partial.click(); return true; }
-    return false;
-  }, programName);
-}
-
-async function waitForModal(page: SPage, timeoutMs = 6000): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+async function waitForModal(page: SPage, ms = 7000): Promise<boolean> {
+  const t = Date.now() + ms;
+  while (Date.now() < t) {
     const open: boolean = await page.evaluate((): boolean => {
-      const standard = document.querySelector<HTMLElement>(
-        '.modal[style*="display: block"], .modal.show, [role="dialog"]'
-      );
-      if (standard && standard.offsetParent !== null) return true;
-      const seraModal = document.querySelector("sera-modal");
-      if (seraModal?.shadowRoot && seraModal.shadowRoot.childElementCount > 0) return true;
-      return Array.from(document.querySelectorAll<HTMLElement>("h5, h4, .modal-title")).some(
-        (h) => h.textContent?.includes("Edit Memberships") && h.offsetParent !== null
-      );
+      if (document.querySelector<HTMLElement>('.modal.show,[role="dialog"]')?.offsetParent) return true;
+      const sm = document.querySelector("sera-modal");
+      if (sm?.shadowRoot && sm.shadowRoot.childElementCount > 0) return true;
+      return !!document.querySelector<HTMLElement>(".modal-title,h4,h5")
+        ?.textContent?.includes("Edit Memberships");
     });
     if (open) return true;
     await page.waitForTimeout(300);
@@ -184,132 +98,150 @@ async function waitForModal(page: SPage, timeoutMs = 6000): Promise<boolean> {
   return false;
 }
 
-/** Wait for the modal to CLOSE (row saved → modal dismissed) */
-async function waitForModalClose(page: SPage, timeoutMs = 8000): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const stillOpen: boolean = await page.evaluate((): boolean => {
-      const seraModal = document.querySelector("sera-modal");
-      if (seraModal?.shadowRoot && seraModal.shadowRoot.childElementCount > 0) return true;
-      const standard = document.querySelector<HTMLElement>(
-        '.modal[style*="display: block"], .modal.show, [role="dialog"]'
-      );
-      if (standard && standard.offsetParent !== null) return true;
-      return Array.from(document.querySelectorAll<HTMLElement>("h5, h4, .modal-title")).some(
-        (h) => h.textContent?.includes("Edit Memberships") && h.offsetParent !== null
-      );
+async function waitForModalClose(page: SPage, ms = 10000): Promise<boolean> {
+  const t = Date.now() + ms;
+  while (Date.now() < t) {
+    const open: boolean = await page.evaluate((): boolean => {
+      if (document.querySelector<HTMLElement>('.modal.show,[role="dialog"]')?.offsetParent) return true;
+      const sm = document.querySelector("sera-modal");
+      return !!(sm?.shadowRoot && sm.shadowRoot.childElementCount > 0);
     });
-    if (!stillOpen) return true; // modal closed = save succeeded
+    if (!open) return true;
     await page.waitForTimeout(300);
   }
-  return false; // timed out — modal never closed
+  return false;
 }
 
-async function detectModalVariant(page: SPage): Promise<ModalVariant> {
+async function detectVariant(page: SPage): Promise<ModalVariant> {
   return page.evaluate((): ModalVariant => {
-    const mainText = document.body.innerText.toLowerCase();
-    if (mainText.includes("ends on"))      return "ends-on";
-    if (mainText.includes("next billing")) return "next-billing";
-    const seraModal = document.querySelector("sera-modal");
-    if (seraModal?.shadowRoot) {
-      const shadow = seraModal.shadowRoot.textContent?.toLowerCase() ?? "";
-      if (shadow.includes("ends on"))      return "ends-on";
-      if (shadow.includes("next billing")) return "next-billing";
+    const t = document.body.innerText.toLowerCase();
+    if (t.includes("ends on")) return "ends-on";
+    if (t.includes("next billing")) return "next-billing";
+    const sm = document.querySelector("sera-modal");
+    if (sm?.shadowRoot) {
+      const st = (sm.shadowRoot.textContent ?? "").toLowerCase();
+      if (st.includes("ends on")) return "ends-on";
+      if (st.includes("next billing")) return "next-billing";
     }
     return "unknown";
   });
 }
 
-async function fillDateByLabel(page: SPage, labelText: string, dateValue: string): Promise<void> {
+/**
+ * Type a date into a SERA date input.
+ * Strategy:
+ *  1. Find input element by its label text (searches main DOM + sera-modal shadow root)
+ *  2. Click the field 3× to select-all
+ *  3. Type the date string (MM/DD/YYYY) using CDP Input.insertText
+ *  4. Tab out to commit the value
+ */
+async function typeDate(page: SPage, labelText: string, dateValue: string): Promise<void> {
+  // Find the input and stamp a stable ID on it
   const inputId: string = await page.evaluate(
-    (args: { label: string; id: string }): string => {
-      const { label, id } = args;
-
-      const findInputForLabel = (lbl: HTMLLabelElement): HTMLInputElement | null => {
-        const forAttr = lbl.getAttribute("for");
-        if (forAttr) {
-          const el = document.getElementById(forAttr) as HTMLInputElement | null;
-          if (el) return el;
+    (args: { label: string; stamp: string }): string => {
+      const find = (root: Document | ShadowRoot): HTMLInputElement | null => {
+        for (const lbl of Array.from(root.querySelectorAll<HTMLLabelElement>("label"))) {
+          if (lbl.textContent?.trim().toLowerCase() !== args.label.toLowerCase()) continue;
+          const forId = lbl.getAttribute("for");
+          if (forId) {
+            const el = (root instanceof Document ? root : document).getElementById(forId);
+            if (el) return el as HTMLInputElement;
+          }
+          // Walk siblings
+          let sib = lbl.nextElementSibling;
+          while (sib) {
+            if (sib.tagName === "INPUT") return sib as HTMLInputElement;
+            const inp = sib.querySelector<HTMLInputElement>("input");
+            if (inp) return inp;
+            sib = sib.nextElementSibling;
+          }
         }
-        let next = lbl.nextElementSibling;
-        while (next) {
-          if ((next as HTMLInputElement).tagName === "INPUT") return next as HTMLInputElement;
-          const inp = next.querySelector<HTMLInputElement>("input");
-          if (inp) return inp;
-          next = next.nextElementSibling;
-        }
-        return lbl.querySelector<HTMLInputElement>("input");
+        return null;
       };
-
-      const searchRoot = (root: Document | ShadowRoot): HTMLInputElement | null => {
-        const lbl = Array.from(root.querySelectorAll<HTMLLabelElement>("label")).find(
-          (el) => el.textContent?.trim().toLowerCase() === label.toLowerCase()
-        );
-        return lbl ? findInputForLabel(lbl) : null;
-      };
-
-      let inp = searchRoot(document);
-      if (!inp) {
+      let el = find(document);
+      if (!el) {
         const sm = document.querySelector("sera-modal");
-        if (sm?.shadowRoot) inp = searchRoot(sm.shadowRoot);
+        if (sm?.shadowRoot) el = find(sm.shadowRoot);
       }
-      if (!inp) return "";
-
-      inp.id = inp.id || id;
-      return inp.id;
+      if (!el) return "";
+      if (!el.id) el.id = args.stamp;
+      return el.id;
     },
-    { label: labelText, id: `__sh_${labelText.replace(/\s+/g, "_").toLowerCase()}_${Date.now()}` }
+    { label: labelText, stamp: `__d_${labelText.replace(/\W/g, "")}_${Date.now()}` }
   );
 
-  if (!inputId) throw new Error(`Input not found for label "${labelText}"`);
+  if (!inputId) throw new Error(`Label "${labelText}" not found`);
 
   const loc = page.locator(`#${inputId}`).first();
+
+  // Click 3× to select existing content, then type over it
   await loc.click({ clickCount: 3 });
-  await page.waitForTimeout(150);
-  await loc.fill(dateValue);
   await page.waitForTimeout(200);
 
-  // Fire change/blur so the framework registers the new value
-  await page.evaluate((id: string): void => {
-    const el = document.getElementById(id);
-    if (el) {
-      el.dispatchEvent(new Event("input",  { bubbles: true }));
-      el.dispatchEvent(new Event("change", { bubbles: true }));
-      el.dispatchEvent(new Event("blur",   { bubbles: true }));
-    }
-  }, inputId);
+  // Select all via Ctrl+A
+  await page.sendCDP("Input.dispatchKeyEvent", {
+    type: "keyDown", key: "a", code: "KeyA",
+    modifiers: 2, windowsVirtualKeyCode: 65,
+  });
+  await page.sendCDP("Input.dispatchKeyEvent", {
+    type: "keyUp", key: "a", code: "KeyA",
+    modifiers: 2, windowsVirtualKeyCode: 65,
+  });
+  await page.waitForTimeout(100);
 
+  // Type the date
+  await page.sendCDP("Input.insertText", { text: dateValue });
   await page.waitForTimeout(200);
+
+  // Tab to commit
+  await page.sendCDP("Input.dispatchKeyEvent", {
+    type: "keyDown", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9,
+  });
+  await page.sendCDP("Input.dispatchKeyEvent", {
+    type: "keyUp", key: "Tab", code: "Tab", windowsVirtualKeyCode: 9,
+  });
+  await page.waitForTimeout(400);
+
+  // Verify the value was accepted
+  const actual: string = await page.evaluate(
+    (id: string): string => (document.getElementById(id) as HTMLInputElement)?.value ?? "",
+    inputId
+  );
+  console.log(`  ℹ️  "${labelText}" field value after typing: "${actual}"`);
 }
 
 /**
- * Click "Save & Complete" using a real CDP mouse event.
+ * Click Save & Complete.
  *
- * Why: SERA's button lives inside a sera-modal shadow root. JS .click() dispatches
- * a synthetic DOM event which many modern frameworks (Angular, web components) ignore
- * for form submission. We need the same path as a real user click:
- *   1. Resolve button objectId via Runtime.evaluate (works in shadow DOM)
- *   2. DOM.scrollIntoViewIfNeeded  →  scroll button into viewport
- *   3. DOM.getBoxModel             →  get pixel coordinates
- *   4. Input.dispatchMouseEvent    →  fire real mousemove + mousedown + mouseup + click
+ * We try three strategies in order:
+ *  1. stagehand.act() — works if the button is in Stagehand's DOM snapshot
+ *  2. CDP mouse click via getBoundingClientRect coordinates (works on shadow DOM)
+ *  3. JS .click() composed event as last resort
  */
-async function clickSaveAndComplete(page: SPage): Promise<void> {
-  // Step 1: Resolve the button's remote objectId from shadow DOM
-  const objectId: string = await page.evaluate((): string => {
+async function clickSave(stagehand: V3, page: SPage): Promise<void> {
+  // Strategy 1: stagehand.act() — let the AI find it
+  try {
+    await stagehand.act(
+      'Click the blue "Save & Complete" button at the bottom right of the modal dialog that is currently open on screen'
+    );
+    console.log("  ℹ️  Save clicked via stagehand.act()");
+    return;
+  } catch (e: unknown) {
+    console.log(`  ⚠️  act() failed: ${e instanceof Error ? e.message.split("\n")[0] : e}`);
+  }
+
+  // Strategy 2: CDP mouse click using getBoundingClientRect
+  // getBoundingClientRect works across shadow roots (it returns viewport coords)
+  const coords: { x: number; y: number; ok: boolean } = await page.evaluate((): { x: number; y: number; ok: boolean } => {
     const findBtn = (root: Document | ShadowRoot): HTMLElement | null => {
-      for (const el of Array.from(root.querySelectorAll<HTMLElement>(
-        "button, input[type='submit'], [role='button']"
-      ))) {
-        const txt = el.textContent?.trim().toLowerCase() ?? "";
-        if (txt === "save & complete" || txt === "save and complete") return el;
+      for (const el of Array.from(root.querySelectorAll<HTMLElement>("button,input[type=submit],[role=button]"))) {
+        const t = el.textContent?.trim().toLowerCase() ?? "";
+        if (t === "save & complete" || t === "save and complete") return el;
       }
       return null;
     };
 
-    // Try main DOM
     let btn = findBtn(document);
-
-    // Try sera-modal shadow root (and one level deeper)
     if (!btn) {
       const sm = document.querySelector("sera-modal");
       if (sm?.shadowRoot) {
@@ -325,114 +257,55 @@ async function clickSaveAndComplete(page: SPage): Promise<void> {
       }
     }
 
-    if (!btn) return "";
+    if (!btn) return { x: 0, y: 0, ok: false };
 
-    // Assign a temporary __objectId trick: tag the element so Runtime.evaluate
-    // can return its remote reference. We use a data attribute as a bridge.
-    const tag = `__save_${Date.now()}`;
-    btn.setAttribute("data-sh-save", tag);
-    return tag;
+    btn.scrollIntoView({ block: "center", inline: "center" });
+    const r = btn.getBoundingClientRect();
+    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), ok: r.width > 0 };
   });
 
-  if (!objectId) {
-    throw new Error("Save & Complete button not found in DOM or shadow root");
+  if (coords.ok) {
+    const { x, y } = coords;
+    await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseMoved",   x, y, button: "none" });
+    await page.sendCDP("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+    await page.waitForTimeout(100);
+    await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+    console.log(`  ℹ️  Save clicked via CDP mouse at (${x}, ${y})`);
+    return;
   }
 
-  // Step 2: Use Runtime.evaluate to get the actual remote objectId for the tagged element
-  const attr    = "data-sh-save";
-  const sel     = "[" + attr + "=\"" + objectId + "\"]";
-  const expr1   = "document.querySelector('" + sel + "')";
-  const resolved = await page.sendCDP<CdpResolveNode>("Runtime.evaluate", {
-    expression:    expr1,
-    returnByValue: false,
-  });
-
-  // If main DOM resolution worked
-  let remoteObjectId = resolved?.object?.objectId ?? "";
-
-  // If not found in main DOM, evaluate from shadow root
-  if (!remoteObjectId) {
-    const expr2 =
-      "(function() {" +
-      "  var sm = document.querySelector('sera-modal');" +
-      "  if (!sm || !sm.shadowRoot) return null;" +
-      "  var el = sm.shadowRoot.querySelector('" + sel + "');" +
-      "  if (el) return el;" +
-      "  var children = sm.shadowRoot.querySelectorAll('*');" +
-      "  for (var i = 0; i < children.length; i++) {" +
-      "    if (children[i].shadowRoot) {" +
-      "      var deep = children[i].shadowRoot.querySelector('" + sel + "');" +
-      "      if (deep) return deep;" +
-      "    }" +
-      "  }" +
-      "  return null;" +
-      "})()";
-    const shadowResolved = await page.sendCDP<CdpResolveNode>("Runtime.evaluate", {
-      expression:    expr2,
-      returnByValue: false,
-    });
-    remoteObjectId = shadowResolved?.object?.objectId ?? "";
-  }
-
-  if (!remoteObjectId) {
-    throw new Error("Could not resolve Save & Complete button remote objectId");
-  }
-
-  // Step 3: Scroll into view
-  try {
-    await page.sendCDP("DOM.scrollIntoViewIfNeeded", { objectId: remoteObjectId });
-    await page.waitForTimeout(200);
-  } catch { /* ignore scroll errors */ }
-
-  // Step 4: Get bounding box to find center coordinates
-  const boxResult = await page.sendCDP<CdpBoxModel>("DOM.getBoxModel", {
-    objectId: remoteObjectId,
-  });
-
-  const content = boxResult?.model?.content;
-  if (!content || content.length < 8) {
-    throw new Error("Could not get bounding box for Save & Complete button");
-  }
-
-  // content is [x1,y1, x2,y2, x3,y3, x4,y4] — top-left and bottom-right corners
-  const cx = Math.round((content[0] + content[2]) / 2);
-  const cy = Math.round((content[1] + content[5]) / 2);
-
-  // Step 5: Fire real CDP mouse events (mousemove → mousedown → mouseup)
-  await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseMoved",  x: cx, y: cy, button: "none" });
-  await page.sendCDP("Input.dispatchMouseEvent", { type: "mousePressed", x: cx, y: cy, button: "left", clickCount: 1 });
-  await page.waitForTimeout(80);
-  await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseReleased", x: cx, y: cy, button: "left", clickCount: 1 });
-
-  console.log(`  ℹ️  CDP mouse click fired at (${cx}, ${cy})`);
-
-  // Clean up the data attribute
-  await page.evaluate((tag: string): void => {
-    const el = document.querySelector(`[data-sh-save="${tag}"]`);
-    if (el) el.removeAttribute("data-sh-save");
+  // Strategy 3: composed JS click
+  const jsClicked: boolean = await page.evaluate((): boolean => {
+    const findBtn = (root: Document | ShadowRoot): HTMLElement | null => {
+      for (const el of Array.from(root.querySelectorAll<HTMLElement>("button,[role=button]"))) {
+        const t = el.textContent?.trim().toLowerCase() ?? "";
+        if (t === "save & complete" || t === "save and complete") return el;
+      }
+      return null;
+    };
+    let btn = findBtn(document);
     const sm = document.querySelector("sera-modal");
-    if (sm?.shadowRoot) {
-      const sel = sm.shadowRoot.querySelector(`[data-sh-save="${tag}"]`);
-      if (sel) sel.removeAttribute("data-sh-save");
-    }
-  }, objectId).catch(() => {});
+    if (!btn && sm?.shadowRoot) btn = findBtn(sm.shadowRoot);
+    if (!btn) return false;
+    btn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, composed: true }));
+    return true;
+  });
+
+  if (!jsClicked) throw new Error("Save & Complete button not found anywhere");
+  console.log("  ℹ️  Save clicked via composed MouseEvent");
 }
 
 // =============================================================================
-// MAIN TASK
+// MAIN
 // =============================================================================
 
 async function runMembershipTask(): Promise<TaskResult> {
-  const startTime = Date.now();
+  const t0 = Date.now();
 
   const stagehand = new Stagehand({
     env: "BROWSERBASE",
-    model: {
-      modelName: "google/gemini-2.5-flash",
-      apiKey: process.env.GEMINI_API_KEY ?? "",
-    },
-    verbose: 1,
-    disablePino: true,
+    model: { modelName: "google/gemini-2.5-flash", apiKey: process.env.GEMINI_API_KEY ?? "" },
+    verbose: 1, disablePino: true,
   });
 
   let sessionUrl = "";
@@ -446,223 +319,200 @@ async function runMembershipTask(): Promise<TaskResult> {
 
     const page: SPage = stagehand.context.activePage()!;
 
-    // ----------------------------------------------------------------
-    // STEP 1 — Login
-    // ----------------------------------------------------------------
-    console.log("\n[1] → Logging in …");
+    // ── Login ────────────────────────────────────────────────────────
+    console.log("\n[1] → Login");
     await page.goto("https://misterquik.sera.tech/admins/login");
     await page.waitForTimeout(3000);
 
     if (page.url().includes("/login")) {
-      const email    = process.env.SERA_EMAIL    ?? "mcc@stratablue.com";
-      const password = process.env.SERA_PASSWORD ?? "";
-
-      await page.locator('input[type="email"]').first().fill(email);
-      await page.locator('input[type="password"]').first().fill(password);
+      await page.locator('input[type="email"]').first().fill(
+        process.env.SERA_EMAIL ?? "mcc@stratablue.com"
+      );
+      await page.locator('input[type="password"]').first().fill(
+        process.env.SERA_PASSWORD ?? ""
+      );
       await page.waitForTimeout(400);
 
       const clicked: boolean = await page.evaluate((): boolean => {
-        const btn = Array.from(
-          document.querySelectorAll<HTMLElement>('button, input[type="submit"]')
-        ).find(
-          (el) =>
-            ["sign in", "login", "log in"].some(
-              (kw) =>
-                el.textContent?.toLowerCase().trim() === kw ||
-                (el as HTMLInputElement).value?.toLowerCase() === kw
+        const btn = Array.from(document.querySelectorAll<HTMLElement>('button,input[type=submit]'))
+          .find(el =>
+            ["sign in","login","log in"].some(k =>
+              el.textContent?.toLowerCase().trim() === k ||
+              (el as HTMLInputElement).value?.toLowerCase() === k
             ) && el.offsetParent !== null
-        );
+          );
         if (btn) { btn.click(); return true; }
         return false;
       });
+      if (!clicked) await page.locator('button[type=submit]').first().click();
 
-      if (!clicked) await page.locator('button[type="submit"]').first().click();
-
-      let loggedIn = false;
+      let ok = false;
       for (let i = 0; i < 30; i++) {
         await page.waitForTimeout(1000);
-        if (!page.url().includes("/login")) { loggedIn = true; break; }
+        if (!page.url().includes("/login")) { ok = true; break; }
       }
-      if (!loggedIn) throw new Error("Still on login page after 30 s");
+      if (!ok) throw new Error("Login failed");
       console.log("    ✅ Logged in");
     } else {
       console.log("    ✅ Already logged in");
     }
 
-    // ----------------------------------------------------------------
-    // STEP 2 — Navigate and read ALL rows ONCE
-    // ----------------------------------------------------------------
-    console.log("\n[2] → Loading /memberships …");
+    // ── Load memberships & read rows ─────────────────────────────────
+    console.log("\n[2] → /memberships");
     await page.goto("https://misterquik.sera.tech/memberships");
     await page.waitForTimeout(3000);
 
-    const allRows = await waitForTableRows(page);
-    console.log(`    ℹ️  Found ${allRows.length} row(s):`);
+    const allRows = await waitForRows(page);
+    console.log(`    ℹ️  ${allRows.length} row(s)`);
     allRows.forEach((r, i) =>
-      console.log(`      [${i + 1}] ${r.soldOn} | ${r.customer} | "${r.program}" | Job #${r.job}`)
+      console.log(`      [${i+1}] ${r.soldOn} | ${r.customer} | ${r.program}`)
     );
 
     if (allRows.length === 0) {
       return {
-        success: true,
-        message: "No membership rows found — nothing to process.",
-        processedCount: 0, failedCount: 0,
-        processed: [], failed: [],
-        elapsedMinutes: parseFloat(((Date.now() - startTime) / 60000).toFixed(2)),
-        sessionUrl,
+        success: true, message: "No rows found.",
+        processedCount: 0, failedCount: 0, processed: [], failed: [],
+        elapsedMinutes: parseFloat(((Date.now()-t0)/60000).toFixed(2)), sessionUrl,
       };
     }
 
-    // ----------------------------------------------------------------
-    // STEP 3 — Process each row
-    // ----------------------------------------------------------------
+    // ── Process each row ─────────────────────────────────────────────
     for (let i = 0; i < allRows.length; i++) {
-      const row             = allRows[i];
-      const secondDate      = calcSecondDate(row.soldOn, row.program);
-      const expectedVariant = getModalVariant(row.program);
+      const row    = allRows[i];
+      const date2  = calcSecondDate(row.soldOn, row.program);
+      const expVar = getModalVariant(row.program);
 
-      console.log(`\n[3.${i + 1}] ──────────────────────────────────────────`);
-      console.log(`  Customer : ${row.customer}`);
-      console.log(`  Program  : "${row.program}"`);
-      console.log(`  Sold On  : ${row.soldOn}`);
-      console.log(`  Expected : ${expectedVariant === "ends-on" ? "Ends On" : "Next Billing Date"} → ${secondDate}`);
+      console.log(`\n[3.${i+1}] ${row.customer} | "${row.program}"`);
+      console.log(`  Sold On: ${row.soldOn}  →  ${expVar === "ends-on" ? "Ends On" : "Next Billing"}: ${date2}`);
 
-      // Fresh navigation for every row
       await page.goto("https://misterquik.sera.tech/memberships");
       await page.waitForTimeout(2000);
 
-      const tableRows = await waitForTableRows(page, 8000);
-      if (tableRows.length === 0) {
-        failed.push({ ...row, message: "Table empty after reload" });
-        console.log("  ❌ Table not found — skipping");
-        continue;
+      if ((await waitForRows(page, 8000)).length === 0) {
+        failed.push({ ...row, message: "Table empty after reload" }); continue;
       }
 
-      // ── 3a. Click program link ─────────────────────────────────────
-      console.log(`  → Clicking: "${row.program}"`);
-      const clicked = await clickProgramLink(page, row.program);
-      if (!clicked) {
-        failed.push({ ...row, message: "Program link not found" });
-        console.log("  ❌ Link not found — skipping");
-        continue;
+      // Click program link
+      const linkClicked: boolean = await page.evaluate((target: string): boolean => {
+        const a = Array.from(document.querySelectorAll<HTMLAnchorElement>("a"))
+          .find(el =>
+            el.textContent?.trim().toLowerCase() === target.toLowerCase() && el.offsetParent !== null
+          );
+        if (a) { a.click(); return true; }
+        const p = Array.from(document.querySelectorAll<HTMLAnchorElement>("a"))
+          .find(el =>
+            el.textContent?.trim().toLowerCase().startsWith(target.toLowerCase().substring(0,12)) &&
+            el.offsetParent !== null && !/^\d+$/.test(el.textContent?.trim() ?? "")
+          );
+        if (p) { p.click(); return true; }
+        return false;
+      }, row.program);
+
+      if (!linkClicked) {
+        failed.push({ ...row, message: "Program link not found" }); continue;
       }
 
-      // ── 3b. Wait for modal ─────────────────────────────────────────
-      const modalOpen = await waitForModal(page, 6000);
+      const modalOpen = await waitForModal(page, 7000);
       if (!modalOpen) {
-        failed.push({ ...row, message: `Modal did not open. Session: ${sessionUrl}` });
-        console.log("  ❌ Modal not opened — skipping");
-        continue;
+        failed.push({ ...row, message: "Modal did not open" }); continue;
       }
       console.log("  ✅ Modal open");
-      await page.waitForTimeout(600); // let modal fully render
+      await page.waitForTimeout(800);
 
-      // ── 3c. Detect variant ─────────────────────────────────────────
-      const actualVariant    = await detectModalVariant(page);
-      const variantToUse     = actualVariant !== "unknown" ? actualVariant : expectedVariant;
-      const secondFieldLabel = variantToUse === "ends-on" ? "Ends On" : "Next Billing Date";
-      console.log(`  ℹ️  Variant: "${secondFieldLabel}"`);
+      const variant  = await detectVariant(page);
+      const useVar   = variant !== "unknown" ? variant : expVar;
+      const field2   = useVar === "ends-on" ? "Ends On" : "Next Billing Date";
+      console.log(`  ℹ️  Field: "${field2}"`);
 
-      // ── 3d. Set Starts On ──────────────────────────────────────────
-      console.log(`  → Starts On → ${row.soldOn}`);
-      let startsOnSet = false;
-      for (let attempt = 1; attempt <= 3; attempt++) {
+      // Set Starts On
+      let startsOk = false;
+      for (let a = 1; a <= 3; a++) {
         try {
-          await fillDateByLabel(page, "Starts On", row.soldOn);
-          console.log(`  ✅ Starts On set (attempt ${attempt})`);
-          startsOnSet = true;
-          break;
+          await typeDate(page, "Starts On", row.soldOn);
+          console.log(`  ✅ Starts On (attempt ${a})`);
+          startsOk = true; break;
         } catch (e: unknown) {
-          console.log(`  ⚠️  Attempt ${attempt}: ${e instanceof Error ? e.message : e}`);
-          await page.waitForTimeout(600);
+          console.log(`  ⚠️  Starts On attempt ${a}: ${e instanceof Error ? e.message : e}`);
+          await page.waitForTimeout(500);
         }
       }
-      if (!startsOnSet) console.log("  ⚠️  Starts On not set — continuing");
+      if (!startsOk) console.log("  ⚠️  Starts On not confirmed");
 
-      // ── 3e. Set second date ────────────────────────────────────────
-      console.log(`  → "${secondFieldLabel}" → ${secondDate}`);
+      // Set second date
       try {
-        await fillDateByLabel(page, secondFieldLabel, secondDate);
-        console.log(`  ✅ "${secondFieldLabel}" set`);
+        await typeDate(page, field2, date2);
+        console.log(`  ✅ "${field2}"`);
       } catch (e: unknown) {
-        console.log(`  ⚠️  ${e instanceof Error ? e.message : e}`);
+        console.log(`  ⚠️  "${field2}": ${e instanceof Error ? e.message : e}`);
       }
 
-      // Small pause so the app processes the date changes before we click Save
-      await page.waitForTimeout(500);
+      await page.waitForTimeout(600);
 
-      // ── 3f. Click Save & Complete (real CDP mouse event) ───────────
-      console.log("  → Save & Complete (CDP mouse click) …");
+      // Save & Complete
+      console.log("  → Save & Complete …");
       try {
-        await clickSaveAndComplete(page);
+        await clickSave(stagehand, page);
+        await page.waitForTimeout(500);
 
-        // ── 3g. VERIFY: wait for modal to close ──────────────────────
-        console.log("  → Waiting for modal to close …");
-        const saved = await waitForModalClose(page, 8000);
-
-        if (!saved) {
-          failed.push({ ...row, message: "Save & Complete clicked but modal did not close — save may have failed" });
-          console.log("  ❌ Modal still open after 8 s — marking as failed");
+        const closed = await waitForModalClose(page, 10000);
+        if (!closed) {
+          failed.push({ ...row, message: "Modal did not close after save — save may have failed" });
+          console.log("  ❌ Modal still open after 10 s");
           continue;
         }
 
-        console.log("  ✅ Saved and confirmed (modal closed)");
+        console.log("  ✅ Saved (modal closed)");
         processed.push({
           customer: row.customer, job: row.job, program: row.program,
           soldOn: row.soldOn, startsOn: row.soldOn,
-          secondDateField: secondFieldLabel, secondDateValue: secondDate,
-          message:
-            `${row.customer} | Job #${row.job} | ${row.program}` +
-            ` | Starts On: ${row.soldOn} | ${secondFieldLabel}: ${secondDate}`,
+          secondDateField: field2, secondDateValue: date2,
+          message: `${row.customer} | Job #${row.job} | ${row.program} | Starts On: ${row.soldOn} | ${field2}: ${date2}`,
         });
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e);
-        failed.push({ ...row, message: `Save & Complete failed: ${msg}` });
+        failed.push({ ...row, message: `Save failed: ${msg}` });
         console.log(`  ❌ ${msg}`);
       }
     }
 
-  } catch (error: unknown) {
-    const msg = error instanceof Error ? error.message : String(error);
-    console.error(`\n❌ Fatal: ${msg}`);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`❌ Fatal: ${msg}`);
     failed.push({ message: `Fatal: ${msg}` });
   } finally {
     await stagehand.close();
-    console.log("\n🔒 Session closed");
+    console.log("🔒 Closed");
   }
 
-  const elapsed = ((Date.now() - startTime) / 60000).toFixed(2);
+  const elapsed = ((Date.now()-t0)/60000).toFixed(2);
   const success = failed.length === 0;
 
   let message: string;
-  if (processed.length === 0 && failed.length === 0) {
-    message = "No memberships found to process.";
+  if (!processed.length && !failed.length) {
+    message = "Nothing to process.";
   } else {
     const lines: string[] = [];
-    if (processed.length > 0) {
+    if (processed.length) {
       lines.push(`✅ Processed ${processed.length} membership(s):`);
-      processed.forEach((p) => lines.push(`   - ${p.message}`));
+      processed.forEach(p => lines.push(`   - ${p.message}`));
     }
-    if (failed.length > 0) {
+    if (failed.length) {
       lines.push(`❌ Failed ${failed.length} membership(s):`);
-      failed.forEach((f) => lines.push(`   - ${f.customer ?? "unknown"} | ${f.message}`));
+      failed.forEach(f => lines.push(`   - ${f.customer ?? "unknown"} | ${f.message}`));
     }
     message = lines.join("\n");
   }
-
-  console.log(`\n📋 Summary:\n${message}\n⏱  ${elapsed} min`);
 
   return {
     success, message,
     processedCount: processed.length, failedCount: failed.length,
     processed, failed,
-    elapsedMinutes: parseFloat(elapsed),
-    sessionUrl,
+    elapsedMinutes: parseFloat(elapsed), sessionUrl,
   };
 }
 
 // =============================================================================
-// EXPRESS SERVER
+// EXPRESS
 // =============================================================================
 
 const app = express();
@@ -675,17 +525,14 @@ app.get("/health", (_req: Request, res: Response): void => {
 app.post("/run-membership-fix", async (_req: Request, res: Response): Promise<void> => {
   console.log(`\n📥 [${new Date().toISOString()}] POST /run-membership-fix`);
   try {
-    const result = await runMembershipTask();
-    res.json(result);
-  } catch (error: unknown) {
-    const msg = error instanceof Error ? error.message : String(error);
+    res.json(await runMembershipTask());
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
     res.status(500).json({ success: false, message: `Server error: ${msg}` });
   }
 });
 
 const PORT = parseInt(process.env.PORT ?? "3000", 10);
 app.listen(PORT, () => {
-  console.log(`\n🚀 Active Membership Server on port ${PORT}`);
-  console.log(`   POST /run-membership-fix  ← n8n trigger`);
-  console.log(`   GET  /health              ← Render health check\n`);
+  console.log(`🚀 Port ${PORT} | POST /run-membership-fix | GET /health`);
 });
