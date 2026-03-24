@@ -289,88 +289,74 @@ async function typeDate(page: SPage, labelText: string, dateValue: string): Prom
 }
 
 async function clickSave(page: SPage): Promise<string> {
-  // The Save & Complete button is: <span data-v-c7226b75="">Save &amp; Complete</span>
-  // It is a Vue.js scoped element. We find it by its data-v attribute and text,
-  // stamp it with an ID, then use locator.click() for real CDP pointer events.
-  const stampId = "__save_" + Date.now();
+  // Target: <span data-v-c7226b75="">Save & Complete</span>  (Vue scoped component)
+  // Strategy: find via selector, get real viewport coords, fire CDP mouse events.
+  // We do NOT use locator.click() or JS .click() — Vue's event system needs
+  // real pointer events dispatched at the correct screen coordinates.
 
-  const btnId: string = await page.evaluate(
-    function(stamp: string): string {
-      // Search in a given root for the Save & Complete span/button
-      function findSaveBtn(root: Document | ShadowRoot): HTMLElement | null {
-        // Primary: span with data-v-* attribute containing "Save" text
-        const spans = Array.from(root.querySelectorAll<HTMLElement>("span[data-v-c7226b75]"));
-        const byAttr = spans.find(function(el) {
+  const coords: { x: number; y: number; found: boolean; debug: string } = await page.evaluate((): { x: number; y: number; found: boolean; debug: string } => {
+    // Find the span[data-v-c7226b75] that contains "Save" text
+    function findSpan(root: Document | ShadowRoot): HTMLElement | null {
+      // Exact match: span with data-v-c7226b75 attribute
+      const byAttr = Array.from(root.querySelectorAll<HTMLElement>("span[data-v-c7226b75]"))
+        .find(function(el) {
           return (el.textContent || "").trim().toLowerCase().includes("save");
         });
-        if (byAttr) return byAttr;
+      if (byAttr) return byAttr;
 
-        // Secondary: any span/button whose text is exactly "Save & Complete"
-        const allClickable = Array.from(root.querySelectorAll<HTMLElement>("button,span,[role=button]"));
-        return allClickable.find(function(el) {
-          const t = (el.textContent || "").trim().toLowerCase();
-          return t === "save & complete" || t === "save and complete";
-        }) || null;
+      // Fallback: button containing a span with Save text
+      const btns = Array.from(root.querySelectorAll<HTMLElement>("button"));
+      for (let i = 0; i < btns.length; i++) {
+        const btn = btns[i];
+        if (!btn) continue;
+        const t = (btn.textContent || "").trim().toLowerCase();
+        if (t.includes("save") && t.includes("complete")) return btn;
       }
+      return null;
+    }
 
-      // Try main DOM first
-      let el = findSaveBtn(document);
-
-      // Try sera-modal shadow root
-      if (!el) {
-        const sm = document.querySelector("sera-modal");
-        if (sm && sm.shadowRoot) {
-          el = findSaveBtn(sm.shadowRoot);
-          // One level deeper
-          if (!el) {
-            Array.from(sm.shadowRoot.querySelectorAll("*")).forEach(function(child) {
-              if (!el && (child as HTMLElement).shadowRoot) {
-                el = findSaveBtn((child as HTMLElement).shadowRoot as ShadowRoot);
-              }
-            });
-          }
+    let el = findSpan(document);
+    if (!el) {
+      const sm = document.querySelector("sera-modal");
+      if (sm && sm.shadowRoot) {
+        el = findSpan(sm.shadowRoot);
+        if (!el) {
+          Array.from(sm.shadowRoot.querySelectorAll("*")).forEach(function(child) {
+            if (!el && (child as HTMLElement).shadowRoot) {
+              el = findSpan((child as HTMLElement).shadowRoot as ShadowRoot);
+            }
+          });
         }
       }
+    }
 
-      if (!el) return "";
-      el.id = stamp;
-      return stamp;
-    },
-    stampId
-  );
+    if (!el) return { x: 0, y: 0, found: false, debug: "span[data-v-c7226b75] not found" };
 
-  if (!btnId) throw new Error("Save & Complete span not found in DOM or shadow root");
+    el.scrollIntoView({ block: "center", inline: "center" });
+    const r = el.getBoundingClientRect();
+    return {
+      x: Math.round(r.left + r.width / 2),
+      y: Math.round(r.top  + r.height / 2),
+      found: r.width > 0,
+      debug: el.tagName + "[" + el.className + "] text=" + (el.textContent || "").trim() + " at " + Math.round(r.left) + "," + Math.round(r.top),
+    };
+  });
 
-  // locator.click() resolves the element and fires real CDP mousePressed/mouseReleased
-  try {
-    await page.locator("#" + btnId).first().click();
-    return "locator span[data-v-c7226b75]";
-  } catch (e: unknown) {
-    console.log("  locator Save failed: " + (e instanceof Error ? e.message.split("\n")[0].substring(0, 60) : String(e)));
-  }
+  console.log("  Save btn: " + coords.debug);
 
-  // Fallback: CDP mouse via getBoundingClientRect
-  const coords: { x: number; y: number; ok: boolean } = await page.evaluate(
-    function(id: string): { x: number; y: number; ok: boolean } {
-      const el = document.getElementById(id);
-      if (!el) return { x: 0, y: 0, ok: false };
-      el.scrollIntoView({ block: "center" });
-      const r = el.getBoundingClientRect();
-      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), ok: r.width > 0 };
-    },
-    btnId
-  );
+  if (!coords.found) throw new Error("Save & Complete not found: " + coords.debug);
 
-  if (coords.ok) {
-    const { x, y } = coords;
-    await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseMoved",    x, y, button: "none" });
-    await page.sendCDP("Input.dispatchMouseEvent", { type: "mousePressed",  x, y, button: "left", clickCount: 1 });
-    await page.waitForTimeout(80);
-    await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
-    return "CDP Save at (" + x + "," + y + ")";
-  }
+  const { x, y } = coords;
 
-  throw new Error("Save & Complete: all click strategies failed");
+  // Fire the full real mouse event sequence at the button coordinates
+  await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseMoved",    x, y, button: "none" });
+  await page.waitForTimeout(50);
+  await page.sendCDP("Input.dispatchMouseEvent", { type: "mousePressed",  x, y, button: "left", clickCount: 1, modifiers: 0 });
+  await page.waitForTimeout(100);
+  await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1, modifiers: 0 });
+  await page.waitForTimeout(100);
+
+  return "CDP at (" + x + "," + y + ") on " + coords.debug;
 }
 
 // =============================================================================
@@ -543,17 +529,15 @@ async function runMembershipTask(): Promise<TaskResult> {
         const saveMethod = await clickSave(page);
         console.log("  Save via: " + saveMethod);
 
+        // Wait for modal to close
         const closed = await waitForModalClose(page, 10000);
         if (!closed) {
           failed.push({ ...row, message: "Modal did not close after save" });
           console.log("  ERROR: modal did not close");
-          // Close modal manually so we can continue with next row
           await page.evaluate((): void => {
-            const x = document.querySelector<HTMLElement>('.modal .close,[data-dismiss="modal"],[aria-label="Close"]');
-            if (x) x.click();
             const sm = document.querySelector("sera-modal");
             if (sm && sm.shadowRoot) {
-              const xBtn = sm.shadowRoot.querySelector<HTMLElement>(".close,[aria-label=Close],button.close");
+              const xBtn = sm.shadowRoot.querySelector<HTMLElement>("[aria-label=Close],[aria-label=close],.close");
               if (xBtn) xBtn.click();
             }
           });
@@ -561,7 +545,29 @@ async function runMembershipTask(): Promise<TaskResult> {
           continue;
         }
 
-        console.log("  SAVED OK");
+        // Verify save actually worked: the row should no longer be in the table
+        await page.waitForTimeout(500);
+        const rowStillPresent: boolean = await page.evaluate(
+          function(args: { soldOn: string; customer: string }): boolean {
+            const rows = Array.from(document.querySelectorAll("table tbody tr"));
+            return rows.some(function(r) {
+              const cells = r.querySelectorAll("td");
+              const s = (cells[0] ? cells[0].textContent || "" : "").trim();
+              const c = (cells[3] ? cells[3].textContent || "" : "").trim();
+              return s === args.soldOn && c === args.customer;
+            });
+          },
+          { soldOn: row.soldOn, customer: row.customer }
+        );
+
+        if (rowStillPresent) {
+          // Modal closed but row is still in table — save didn't work
+          failed.push({ ...row, message: "Modal closed but row still in table — save did not persist" });
+          console.log("  ERROR: row still in table after save");
+          continue;
+        }
+
+        console.log("  SAVED OK - row removed from table");
         processed.push({
           customer: row.customer, job: row.job, program: row.program,
           soldOn: row.soldOn, startsOn: row.soldOnShort,
