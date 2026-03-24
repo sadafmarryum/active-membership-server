@@ -10,7 +10,8 @@
 //      b. Wait for modal to open
 //      c. Set Starts On and Next Billing Date / Ends On
 //      d. Click Save & Complete
-//      e. Wait for modal to close AND row to disappear — then move to next row
+//      e. Wait for modal to close — then move to next row (NO PAGE RELOAD)
+//      f. Wait up to 3 minutes for the row to disappear from the table
 
 import { Stagehand, V3 } from "@browserbasehq/stagehand";
 import express, { Request, Response } from "express";
@@ -158,8 +159,8 @@ async function openMembershipModal(
 
   if (coords.ok) {
     const { x, y } = coords;
-    await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none" });
-    await page.sendCDP("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1, modifiers: 0 });
+    await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseMoved",    x, y, button: "none" });
+    await page.sendCDP("Input.dispatchMouseEvent", { type: "mousePressed",  x, y, button: "left", clickCount: 1, modifiers: 0 });
     await page.waitForTimeout(80);
     await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1, modifiers: 0 });
     return "CDP span at (" + x + "," + y + ")";
@@ -275,13 +276,17 @@ async function typeDate(page: SPage, labelText: string, dateValue: string): Prom
 }
 
 async function clickSave(page: SPage): Promise<string> {
-  const coords: { x: number; y: number; found: boolean; debug: string } = await page.evaluate(() => {
+  const coords: { x: number; y: number; found: boolean; debug: string } = await page.evaluate((): { x: number; y: number; found: boolean; debug: string } => {
     function findSpan(root: Document | ShadowRoot): HTMLElement | null {
       const byAttr = Array.from(root.querySelectorAll<HTMLElement>("span[data-v-c7226b75]"))
-        .find(el => (el.textContent || "").trim().toLowerCase().includes("save"));
+        .find(function(el) {
+          return (el.textContent || "").trim().toLowerCase().includes("save");
+        });
       if (byAttr) return byAttr;
       const btns = Array.from(root.querySelectorAll<HTMLElement>("button"));
-      for (const btn of btns) {
+      for (let i = 0; i < btns.length; i++) {
+        const btn = btns[i];
+        if (!btn) continue;
         const t = (btn.textContent || "").trim().toLowerCase();
         if (t.includes("save") && t.includes("complete")) return btn;
       }
@@ -291,46 +296,43 @@ async function clickSave(page: SPage): Promise<string> {
     let el = findSpan(document);
     if (!el) {
       const sm = document.querySelector("sera-modal");
-      if (sm && sm.shadowRoot) el = findSpan(sm.shadowRoot);
+      if (sm && sm.shadowRoot) {
+        el = findSpan(sm.shadowRoot);
+        if (!el) {
+          Array.from(sm.shadowRoot.querySelectorAll("*")).forEach(function(child) {
+            if (!el && (child as HTMLElement).shadowRoot) {
+              el = findSpan((child as HTMLElement).shadowRoot as ShadowRoot);
+            }
+          });
+        }
+      }
     }
 
-    if (!el) return { x: 0, y: 0, found: false, debug: "Save button not found" };
+    if (!el) return { x: 0, y: 0, found: false, debug: "span[data-v-c7226b75] not found" };
+
     el.scrollIntoView({ block: "center", inline: "center" });
     const r = el.getBoundingClientRect();
-    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), found: r.width > 0, debug: el.tagName + "[" + el.className + "] text=" + (el.textContent || "").trim() };
+    return {
+      x: Math.round(r.left + r.width / 2),
+      y: Math.round(r.top  + r.height / 2),
+      found: r.width > 0,
+      debug: el.tagName + "[" + el.className + "] text=" + (el.textContent || "").trim() + " at " + Math.round(r.left) + "," + Math.round(r.top),
+    };
   });
+
+  console.log("  Save btn: " + coords.debug);
 
   if (!coords.found) throw new Error("Save & Complete not found: " + coords.debug);
 
   const { x, y } = coords;
-  await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseMoved", x, y, button: "none" });
+  await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseMoved",    x, y, button: "none" });
   await page.waitForTimeout(50);
-  await page.sendCDP("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1, modifiers: 0 });
+  await page.sendCDP("Input.dispatchMouseEvent", { type: "mousePressed",  x, y, button: "left", clickCount: 1, modifiers: 0 });
   await page.waitForTimeout(100);
   await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1, modifiers: 0 });
   await page.waitForTimeout(100);
 
   return "CDP at (" + x + "," + y + ") on " + coords.debug;
-}
-
-// ── NEW HELPER: Wait for row to disappear after save ──────────────
-
-async function waitForRowRemoval(page: SPage, soldOn: string, customer: string, timeout = 120000, interval = 3000): Promise<boolean> {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    const stillThere = await page.evaluate((args: { soldOn: string; customer: string }) => {
-      const rows = Array.from(document.querySelectorAll("table tbody tr"));
-      return rows.some(r => {
-        const cells = r.querySelectorAll("td");
-        const s = (cells[0] ? (cells[0].textContent || "").trim() : "");
-        const c = (cells[3] ? (cells[3].textContent || "").trim() : "");
-        return s === args.soldOn && c === args.customer;
-      });
-    }, { soldOn, customer });
-    if (!stillThere) return true;
-    await page.waitForTimeout(interval);
-  }
-  return false;
 }
 
 // =============================================================================
@@ -347,7 +349,7 @@ async function runMembershipTask(): Promise<TaskResult> {
 
   let sessionUrl = "";
   const processed: ProcessedEntry[] = [];
-  const failed: FailedEntry[] = [];
+  const failed: FailedEntry[]       = [];
 
   try {
     await stagehand.init();
@@ -356,7 +358,7 @@ async function runMembershipTask(): Promise<TaskResult> {
 
     const page: SPage = stagehand.context.activePage()!;
 
-    // ── LOGIN ─────────────────────────
+    // ── Step 1: Login ──────────────────────────────────────────────────
     console.log("[1] Login");
     await page.goto("https://misterquik.sera.tech/admins/login");
     await page.waitForTimeout(3000);
@@ -365,86 +367,124 @@ async function runMembershipTask(): Promise<TaskResult> {
       await page.locator("input[type=email]").first().fill(process.env.SERA_EMAIL ?? "mcc@stratablue.com");
       await page.locator("input[type=password]").first().fill(process.env.SERA_PASSWORD ?? "");
       await page.waitForTimeout(400);
-      await page.evaluate(() => {
+      const clicked: boolean = await page.evaluate((): boolean => {
         const btn = Array.from(document.querySelectorAll<HTMLElement>("button,input[type=submit]"))
-          .find(el => ["sign in","login","log in"].includes((el.textContent || "").trim().toLowerCase()));
-        if (btn) (btn as HTMLElement).click();
+          .find(function(el) {
+            const t = (el.textContent || "").toLowerCase().trim();
+            const v = ((el as HTMLInputElement).value || "").toLowerCase();
+            return t === "sign in" || t === "login" || v === "login" || v === "sign in";
+          });
+        if (btn) { btn.click(); return true; }
+        return false;
       });
-      await page.waitForTimeout(4000);
+      if (!clicked) throw new Error("Cannot click login button");
+      await page.waitForTimeout(5000);
     }
 
-    // ── NAV TO MEMBERSHIPS ────────────
-    console.log("[2] Go /memberships");
+    console.log("[2] Navigate /memberships");
     await page.goto("https://misterquik.sera.tech/admins/memberships");
     await page.waitForTimeout(3000);
 
-    const rows = await waitForRows(page, 10000);
-    console.log("[3] Rows found: " + rows.length);
+    const rows = await waitForRows(page, 15000);
+    if (rows.length === 0) {
+      console.log("No memberships found");
+      return { success: true, message: "No memberships found", processedCount: 0, failedCount: 0, processed: [], failed: [], elapsedMinutes: 0, sessionUrl };
+    }
 
-    for (const row of rows) {
-      console.log(`Processing: ${row.customer} / ${row.program} / ${row.soldOn}`);
-
-      // ── Open modal ──────────────
+    console.log("[3] Found " + rows.length + " memberships");
+    for (let r of rows) {
+      console.log("Processing row: " + r.customer + " / " + r.program + " / " + r.soldOn);
       try {
-        const clickResult = await openMembershipModal(stagehand, page, row.customer, row.soldOn, row.program);
-        console.log("  Modal click: " + clickResult);
+        const clickRes = await openMembershipModal(stagehand, page, r.customer, r.soldOn, r.program);
+        if (clickRes.startsWith("NOT FOUND")) {
+          failed.push({ ...r, message: clickRes });
+          continue;
+        }
+        const modalOpened = await waitForModal(page, 8000);
+        if (!modalOpened) { failed.push({ ...r, message: "Modal did not open" }); continue; }
 
-        const modalOpen = await waitForModal(page, 8000);
-        if (!modalOpen) throw new Error("Modal did not open");
+        const variant = getModalVariant(r.program);
+        const secondDate = calcSecondDate(r.soldOnShort, r.program);
 
-        // ── Fill Dates ─────────────
-        const variant = getModalVariant(row.program);
-        const startsOnVal = await typeDate(page, "Starts On", row.soldOnShort);
-        const secondDateVal = await typeDate(page, variant === "ends-on" ? "Ends On" : "Next Billing Date", calcSecondDate(row.soldOnShort, row.program));
+        const startsOnValue = await typeDate(page, "Starts On", r.soldOnShort);
+        let secondValue = "";
+        if (variant === "next-billing") {
+          secondValue = await typeDate(page, "Next Billing Date", secondDate);
+        } else if (variant === "ends-on") {
+          secondValue = await typeDate(page, "Ends On", secondDate);
+        } else {
+          secondValue = await typeDate(page, "Next Billing Date", secondDate);
+        }
 
-        // ── Save & Complete ────────
-        const saveResult = await clickSave(page);
-        console.log("  Save: " + saveResult);
+        console.log("  Clicking Save & Complete...");
+        await clickSave(page);
+        await waitForModalClose(page, 10000);
 
-        const modalClosed = await waitForModalClose(page, 10000);
-        if (!modalClosed) throw new Error("Modal did not close");
+        // ── NEW LOGIC: Wait up to 3 minutes for row to disappear ──────
+        console.log("  Waiting up to 3 minutes for row to be removed...");
 
-        const removed = await waitForRowRemoval(page, row.soldOn, row.customer, 120000, 3000);
-        if (!removed) throw new Error("Row still present after save");
+        let rowRemoved = false;
+        const startTime = Date.now();
+        while (Date.now() - startTime < 180000) { // 3 minutes
+          const stillThere: boolean = await page.evaluate(
+            function(args: { soldOn: string; customer: string }): boolean {
+              const rows = Array.from(document.querySelectorAll("table tbody tr"));
+              return rows.some(function(r) {
+                const cells = r.querySelectorAll("td");
+                const s = (cells[0] ? (cells[0].textContent || "").trim() : "");
+                const c = (cells[3] ? (cells[3].textContent || "").trim() : "");
+                return s === args.soldOn && c === args.customer;
+              });
+            },
+            { soldOn: r.soldOn, customer: r.customer }
+          );
+
+          if (!stillThere) { rowRemoved = true; break; }
+          console.log("  Still present... retrying in 5s");
+          await page.waitForTimeout(5000);
+        }
+
+        if (!rowRemoved) {
+          failed.push({ ...r, message: "Row not removed after 3 minutes" });
+          console.log("  ERROR: row still in table after 3 minutes");
+          continue;
+        }
 
         processed.push({
-          customer: row.customer, job: row.job, program: row.program,
-          soldOn: row.soldOn, startsOn: startsOnVal,
-          secondDateField: variant, secondDateValue: secondDateVal,
-          message: "Saved OK"
+          customer: r.customer,
+          job: r.job,
+          program: r.program,
+          soldOn: r.soldOn,
+          startsOn: startsOnValue,
+          secondDateField: variant,
+          secondDateValue: secondValue,
+          message: "Saved & Completed",
         });
-        console.log("  ✅ Row processed successfully");
 
       } catch (err: unknown) {
-        failed.push({ customer: row.customer, job: row.job, program: row.program, soldOn: row.soldOn, rowIndex: row.rowIndex, message: err instanceof Error ? err.message : String(err) });
-        console.log("  ❌ Failed: " + (err instanceof Error ? err.message : String(err)));
+        failed.push({ ...r, message: err instanceof Error ? err.message : String(err) });
+        continue;
       }
     }
 
-  } catch (e: unknown) {
-    console.log("Fatal error: " + (e instanceof Error ? e.message : String(e)));
+    const elapsedMinutes = Math.round((Date.now() - t0) / 60000);
+    return { success: true, message: "Completed memberships run", processedCount: processed.length, failedCount: failed.length, processed, failed, elapsedMinutes, sessionUrl };
+
+  } catch (err: unknown) {
+    return { success: false, message: err instanceof Error ? err.message : String(err), processedCount: processed.length, failedCount: failed.length, processed, failed, elapsedMinutes: Math.round((Date.now() - t0)/60000), sessionUrl };
+  } finally {
+    await stagehand.close();
   }
-
-  const elapsedMinutes = Math.round((Date.now() - t0) / 60000);
-
-  return {
-    success: failed.length === 0,
-    message: "Task finished",
-    processedCount: processed.length,
-    failedCount: failed.length,
-    processed, failed,
-    elapsedMinutes, sessionUrl
-  };
 }
 
 // =============================================================================
-// EXPRESS SERVER
+// EXPRESS SERVER ENDPOINT
 // =============================================================================
 
 const app = express();
 app.use(express.json());
 
-app.post("/run-membership-task", async (_req: Request, res: Response) => {
+app.post("/run-membership", async (req: Request, res: Response) => {
   try {
     const result = await runMembershipTask();
     res.json(result);
@@ -453,5 +493,5 @@ app.post("/run-membership-task", async (_req: Request, res: Response) => {
   }
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log("Active Membership server running on port " + port));
+const port = process.env.PORT || 8080;
+app.listen(port, () => console.log(`Server listening on port ${port}`));
