@@ -432,6 +432,18 @@ async function runMembershipTask(): Promise<TaskResult> {
       console.log("  [" + (i + 1) + "] " + r.soldOn + " | " + r.customer + " | " + r.program);
     });
 
+    // DIAGNOSTIC: dump td[4] innerHTML for first 3 rows to see exact DOM structure
+    const diagDump: string = await page.evaluate((): string => {
+      const rows = Array.from(document.querySelectorAll("table tbody tr")).slice(0, 3);
+      return rows.map(function(r, i) {
+        const cells = r.querySelectorAll("td");
+        const td4 = cells[4] as HTMLElement | undefined;
+        return "row[" + i + "] customer=" + (cells[3] ? (cells[3].textContent || "").trim() : "?") +
+               " | td[4] innerHTML=" + (td4 ? td4.innerHTML.substring(0, 300) : "MISSING");
+      }).join("\n---\n");
+    });
+    console.log("\nTABLE td[4] STRUCTURE:\n" + diagDump + "\n");
+
     if (allRows.length === 0) {
       return {
         success: true, message: "No rows found.",
