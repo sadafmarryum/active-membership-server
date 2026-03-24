@@ -392,21 +392,34 @@ async function runMembershipTask(): Promise<TaskResult> {
         failed.push({ ...row, message: "Table empty after reload" }); continue;
       }
 
-      // Click program link
-      const linkClicked: boolean = await page.evaluate((target: string): boolean => {
-        const a = Array.from(document.querySelectorAll<HTMLAnchorElement>("a"))
-          .find(el =>
-            el.textContent?.trim().toLowerCase() === target.toLowerCase() && el.offsetParent !== null
-          );
-        if (a) { a.click(); return true; }
-        const p = Array.from(document.querySelectorAll<HTMLAnchorElement>("a"))
-          .find(el =>
-            el.textContent?.trim().toLowerCase().startsWith(target.toLowerCase().substring(0,12)) &&
-            el.offsetParent !== null && !/^\d+$/.test(el.textContent?.trim() ?? "")
-          );
-        if (p) { p.click(); return true; }
-        return false;
-      }, row.program);
+      // Click the link that opens the Edit Memberships modal for this row.
+      // The clickable link may be on the invoice/job number cell, not the program name.
+      // We find the correct table row by matching soldOn + customer, then click its first <a>.
+      const linkClicked: boolean = await page.evaluate(
+        (args: { soldOn: string; customer: string; program: string; rowIndex: number }): boolean => {
+          const allRows = Array.from(document.querySelectorAll("table tbody tr"));
+
+          // Find row by matching soldOn + customer + program prefix
+          const matchRow = allRows.find(r => {
+            const texts = Array.from(r.querySelectorAll("td")).map(c => c.textContent?.trim() ?? "");
+            return texts.some(t => t === args.soldOn)
+                && texts.some(t => t === args.customer)
+                && texts.some(t => t.startsWith(args.program.substring(0, 10)));
+          }) ?? allRows[args.rowIndex]; // fallback: use stored rowIndex
+
+          if (!matchRow) return false;
+
+          // Click the first visible <a> in the row
+          const link = Array.from(matchRow.querySelectorAll<HTMLAnchorElement>("a"))
+            .find(a => (a as HTMLElement).offsetParent !== null);
+          if (link) { link.click(); return true; }
+
+          // No <a> found — try clicking the row itself (tr onclick handler)
+          (matchRow as HTMLElement).click();
+          return true;
+        },
+        { soldOn: row.soldOn, customer: row.customer, program: row.program, rowIndex: row.rowIndex }
+      );
 
       if (!linkClicked) {
         failed.push({ ...row, message: "Program link not found" }); continue;
