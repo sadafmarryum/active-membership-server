@@ -343,11 +343,12 @@ async function runMembershipTask(): Promise<TaskResult> {
                 return {
                   x: Math.round(rect.left + rect.width / 2),
                   y: Math.round(rect.top + rect.height / 2),
-                  found: true
+                  found: true,
+                  debug: "Fallback: input matched by placeholder"
                 };
               }
             }
-            return { x: 0, y: 0, found: false };
+            return { x: 0, y: 0, found: false, debug: "Fallback: no input found" };
           });
           secondField = fallback;
         }
