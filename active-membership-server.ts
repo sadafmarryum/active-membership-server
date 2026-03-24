@@ -105,15 +105,31 @@ async function waitForRows(page: SPage, ms = 10000): Promise<MembershipRow[]> {
 }
 
 /**
- * Click the program cell to open the Edit Memberships modal.
- * Finds the row fresh each time by soldOn+customer (rows shift as items are processed).
- * Tries multiple strategies:
- *   1. Stamp the td[4] element with a unique ID, use locator.click() (Stagehand pierce)
- *   2. CDP mouse click on td[4] center coordinates
- *   3. CDP mouse click on the <tr> row itself
+ * Open the Edit Memberships modal for a specific customer row.
+ * Uses stagehand.act() as primary — the AI sees the rendered page and clicks
+ * the correct element regardless of DOM structure.
+ * Falls back to direct CDP coordinate click on the program cell.
  */
-async function clickProgramCellByCustomer(page: SPage, customer: string, soldOn: string): Promise<string> {
-  // Stamp a unique ID on the target td[4] so we can use locator.click()
+async function openMembershipModal(
+  stagehand: V3,
+  page: SPage,
+  customer: string,
+  soldOn: string,
+  program: string
+): Promise<string> {
+  // Strategy 1: stagehand.act() — most reliable, AI sees the actual rendered page
+  try {
+    await stagehand.act(
+      "In the memberships table, find the row for customer \"" + customer + "\" " +
+      "with sold date " + soldOn + " and click the program name \"" + program + "\" to open the Edit Memberships modal"
+    );
+    return "act()";
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message.split("\n")[0].substring(0, 100) : String(e);
+    console.log("  act() failed: " + msg);
+  }
+
+  // Strategy 2: stamp td[4] and use locator.click()
   const stampResult: { id: string; trId: string; debug: string } = await page.evaluate(
     function(args: { customer: string; soldOn: string; stamp: string }): { id: string; trId: string; debug: string } {
       const rows = Array.from(document.querySelectorAll("table tbody tr"));
@@ -128,11 +144,7 @@ async function clickProgramCellByCustomer(page: SPage, customer: string, soldOn:
           if (!td) return { id: "", trId: "", debug: "td[4] missing" };
           td.id = args.stamp;
           r.id  = args.stamp + "_tr";
-          return {
-            id: args.stamp,
-            trId: args.stamp + "_tr",
-            debug: "row " + i + " td[4]=" + (td.textContent || "").trim().substring(0, 30),
-          };
+          return { id: args.stamp, trId: args.stamp + "_tr", debug: "row " + i };
         }
       }
       return { id: "", trId: "", debug: "not found in " + rows.length + " rows" };
@@ -142,23 +154,23 @@ async function clickProgramCellByCustomer(page: SPage, customer: string, soldOn:
 
   if (!stampResult.id) return "NOT FOUND: " + stampResult.debug;
 
-  // Strategy 1: locator.click() on the stamped td — Stagehand resolves and fires real events
+  // Try clicking td[4] via locator
   try {
     await page.locator("#" + stampResult.id).first().click();
-    return "locator.click() on td[4] | " + stampResult.debug;
+    return "locator td[4]";
   } catch (e: unknown) {
-    console.log("  locator.click() td failed: " + (e instanceof Error ? e.message.split("\n")[0].substring(0, 60) : String(e)));
+    console.log("  locator td[4] failed");
   }
 
-  // Strategy 2: locator.click() on the <tr> row
+  // Try clicking the tr via locator
   try {
     await page.locator("#" + stampResult.trId).first().click();
-    return "locator.click() on tr | " + stampResult.debug;
+    return "locator tr";
   } catch (e: unknown) {
-    console.log("  locator.click() tr failed: " + (e instanceof Error ? e.message.split("\n")[0].substring(0, 60) : String(e)));
+    console.log("  locator tr failed");
   }
 
-  // Strategy 3: CDP mouse click on td[4] center
+  // Strategy 3: CDP coordinates on td[4]
   const coords: { x: number; y: number; ok: boolean } = await page.evaluate(
     function(id: string): { x: number; y: number; ok: boolean } {
       const el = document.getElementById(id);
@@ -176,10 +188,10 @@ async function clickProgramCellByCustomer(page: SPage, customer: string, soldOn:
     await page.sendCDP("Input.dispatchMouseEvent", { type: "mousePressed",  x, y, button: "left", clickCount: 1, modifiers: 0 });
     await page.waitForTimeout(80);
     await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1, modifiers: 0 });
-    return "CDP click at (" + x + "," + y + ") | " + stampResult.debug;
+    return "CDP (" + x + "," + y + ")";
   }
 
-  return "ALL STRATEGIES FAILED: " + stampResult.debug;
+  return "ALL FAILED";
 }
 
 async function waitForModal(page: SPage, ms = 8000): Promise<boolean> {
@@ -440,7 +452,7 @@ async function runMembershipTask(): Promise<TaskResult> {
 
       // ── 3a. Click the program cell with a real CDP mouse event ─────
       console.log("  Clicking program cell...");
-      const clickResult = await clickProgramCellByCustomer(page, row.customer, row.soldOn);
+      const clickResult = await openMembershipModal(stagehand, page, row.customer, row.soldOn, row.program);
       console.log("  Click: " + clickResult);
 
       // ── 3b. Wait for modal to appear ───────────────────────────────
