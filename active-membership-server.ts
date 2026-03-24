@@ -288,41 +288,78 @@ async function typeDate(page: SPage, labelText: string, dateValue: string): Prom
   }, inputId);
 }
 
-async function clickSave(stagehand: V3, page: SPage): Promise<string> {
-  // Strategy 1: stagehand.act()
-  try {
-    await stagehand.act("Click the blue Save & Complete button in the open modal");
-    return "act()";
-  } catch (e: unknown) {
-    console.log("  act() failed: " + (e instanceof Error ? e.message.split("\n")[0].substring(0, 80) : String(e)));
-  }
+async function clickSave(page: SPage): Promise<string> {
+  // The Save & Complete button is: <span data-v-c7226b75="">Save &amp; Complete</span>
+  // It is a Vue.js scoped element. We find it by its data-v attribute and text,
+  // stamp it with an ID, then use locator.click() for real CDP pointer events.
+  const stampId = "__save_" + Date.now();
 
-  // Strategy 2: CDP mouse via getBoundingClientRect
-  const coords: { x: number; y: number; ok: boolean } = await page.evaluate((): { x: number; y: number; ok: boolean } => {
-    function findBtn(root: Document | ShadowRoot): HTMLElement | null {
-      return Array.from(root.querySelectorAll<HTMLElement>("button,input[type=submit],[role=button]"))
-        .find(function(el) {
+  const btnId: string = await page.evaluate(
+    function(stamp: string): string {
+      // Search in a given root for the Save & Complete span/button
+      function findSaveBtn(root: Document | ShadowRoot): HTMLElement | null {
+        // Primary: span with data-v-* attribute containing "Save" text
+        const spans = Array.from(root.querySelectorAll<HTMLElement>("span[data-v-c7226b75]"));
+        const byAttr = spans.find(function(el) {
+          return (el.textContent || "").trim().toLowerCase().includes("save");
+        });
+        if (byAttr) return byAttr;
+
+        // Secondary: any span/button whose text is exactly "Save & Complete"
+        const allClickable = Array.from(root.querySelectorAll<HTMLElement>("button,span,[role=button]"));
+        return allClickable.find(function(el) {
           const t = (el.textContent || "").trim().toLowerCase();
           return t === "save & complete" || t === "save and complete";
         }) || null;
-    }
-    let btn = findBtn(document);
-    if (!btn) {
-      const sm = document.querySelector("sera-modal");
-      if (sm && sm.shadowRoot) {
-        btn = findBtn(sm.shadowRoot);
-        if (!btn) {
-          Array.from(sm.shadowRoot.querySelectorAll("*")).forEach(function(el) {
-            if (!btn && (el as HTMLElement).shadowRoot) btn = findBtn((el as HTMLElement).shadowRoot as ShadowRoot);
-          });
+      }
+
+      // Try main DOM first
+      let el = findSaveBtn(document);
+
+      // Try sera-modal shadow root
+      if (!el) {
+        const sm = document.querySelector("sera-modal");
+        if (sm && sm.shadowRoot) {
+          el = findSaveBtn(sm.shadowRoot);
+          // One level deeper
+          if (!el) {
+            Array.from(sm.shadowRoot.querySelectorAll("*")).forEach(function(child) {
+              if (!el && (child as HTMLElement).shadowRoot) {
+                el = findSaveBtn((child as HTMLElement).shadowRoot as ShadowRoot);
+              }
+            });
+          }
         }
       }
-    }
-    if (!btn) return { x: 0, y: 0, ok: false };
-    btn.scrollIntoView({ block: "center" });
-    const r = btn.getBoundingClientRect();
-    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), ok: r.width > 0 };
-  });
+
+      if (!el) return "";
+      el.id = stamp;
+      return stamp;
+    },
+    stampId
+  );
+
+  if (!btnId) throw new Error("Save & Complete span not found in DOM or shadow root");
+
+  // locator.click() resolves the element and fires real CDP mousePressed/mouseReleased
+  try {
+    await page.locator("#" + btnId).first().click();
+    return "locator span[data-v-c7226b75]";
+  } catch (e: unknown) {
+    console.log("  locator Save failed: " + (e instanceof Error ? e.message.split("\n")[0].substring(0, 60) : String(e)));
+  }
+
+  // Fallback: CDP mouse via getBoundingClientRect
+  const coords: { x: number; y: number; ok: boolean } = await page.evaluate(
+    function(id: string): { x: number; y: number; ok: boolean } {
+      const el = document.getElementById(id);
+      if (!el) return { x: 0, y: 0, ok: false };
+      el.scrollIntoView({ block: "center" });
+      const r = el.getBoundingClientRect();
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), ok: r.width > 0 };
+    },
+    btnId
+  );
 
   if (coords.ok) {
     const { x, y } = coords;
@@ -330,28 +367,10 @@ async function clickSave(stagehand: V3, page: SPage): Promise<string> {
     await page.sendCDP("Input.dispatchMouseEvent", { type: "mousePressed",  x, y, button: "left", clickCount: 1 });
     await page.waitForTimeout(80);
     await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
-    return "CDP-mouse(" + x + "," + y + ")";
+    return "CDP Save at (" + x + "," + y + ")";
   }
 
-  // Strategy 3: composed JS click
-  const ok: boolean = await page.evaluate((): boolean => {
-    function findBtn(root: Document | ShadowRoot): HTMLElement | null {
-      return Array.from(root.querySelectorAll<HTMLElement>("button,[role=button]"))
-        .find(function(el) {
-          const t = (el.textContent || "").trim().toLowerCase();
-          return t === "save & complete" || t === "save and complete";
-        }) || null;
-    }
-    let btn = findBtn(document);
-    const sm = document.querySelector("sera-modal");
-    if (!btn && sm && sm.shadowRoot) btn = findBtn(sm.shadowRoot);
-    if (!btn) return false;
-    btn.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, composed: true }));
-    return true;
-  });
-
-  if (!ok) throw new Error("Save & Complete button not found");
-  return "composed-click";
+  throw new Error("Save & Complete: all click strategies failed");
 }
 
 // =============================================================================
@@ -465,6 +484,29 @@ async function runMembershipTask(): Promise<TaskResult> {
       console.log("  Modal open OK");
       await page.waitForTimeout(700);
 
+      // DIAGNOSTIC: dump modal button HTML so we can see exact Save button structure
+      const modalDiag: string = await page.evaluate((): string => {
+        const parts: string[] = [];
+        // Check main DOM buttons
+        const btns = Array.from(document.querySelectorAll("button"));
+        parts.push("main-buttons: " + btns.map(function(b) {
+          return "[" + (b.textContent || "").trim().substring(0, 30) + "] class=" + b.className;
+        }).join(" | "));
+        // Check sera-modal shadow root
+        const sm = document.querySelector("sera-modal");
+        if (sm && sm.shadowRoot) {
+          const shadowBtns = Array.from(sm.shadowRoot.querySelectorAll("button"));
+          parts.push("shadow-buttons: " + shadowBtns.map(function(b) {
+            return "[" + (b.textContent || "").trim().substring(0, 30) + "] class=" + b.className;
+          }).join(" | "));
+          // Also dump the bottom of the modal HTML to see button structure
+          const modalEl = sm.shadowRoot.querySelector(".modal-footer,.modal-body") as HTMLElement | null;
+          if (modalEl) parts.push("modal-footer-html: " + modalEl.innerHTML.substring(0, 400));
+        }
+        return parts.join("\n");
+      });
+      if (i === 0) console.log("MODAL BUTTON STRUCTURE:\n" + modalDiag);
+
       // ── 3c. Detect Ends On vs Next Billing Date ────────────────────
       const variant = await detectVariant(page);
       const useVar  = variant !== "unknown" ? variant : expVar;
@@ -498,7 +540,7 @@ async function runMembershipTask(): Promise<TaskResult> {
       // ── 3f. Click Save & Complete ──────────────────────────────────
       console.log("  Saving...");
       try {
-        const saveMethod = await clickSave(stagehand, page);
+        const saveMethod = await clickSave(page);
         console.log("  Save via: " + saveMethod);
 
         const closed = await waitForModalClose(page, 10000);
