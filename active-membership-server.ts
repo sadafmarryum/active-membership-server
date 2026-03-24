@@ -382,7 +382,7 @@ async function runMembershipTask(): Promise<TaskResult> {
     }
 
     console.log("[2] Navigate /memberships");
-    await page.goto("https://misterquik.sera.tech/admins/memberships");
+    await page.goto("https://misterquik.sera.tech/memberships");
     await page.waitForTimeout(3000);
 
     const rows = await waitForRows(page, 15000);
