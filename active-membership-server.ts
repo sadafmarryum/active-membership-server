@@ -313,13 +313,43 @@ async function runMembershipTask(): Promise<TaskResult> {
   try {
     await stagehand.init();
     sessionUrl = "https://browserbase.com/sessions/" + stagehand.browserbaseSessionID;
+    console.log("Session: " + sessionUrl);
 
     const page: SPage = stagehand.context.activePage()!;
 
+    // ── Login ──────────────────────────────────────────────────────────
+    console.log("[1] Login");
+    await page.goto("https://misterquik.sera.tech/admins/login");
+    await page.waitForTimeout(3000);
+
+    if (page.url().includes("/login")) {
+      await page.locator("input[type=email]").first().fill(process.env.SERA_EMAIL ?? "mcc@stratablue.com");
+      await page.locator("input[type=password]").first().fill(process.env.SERA_PASSWORD ?? "");
+      await page.waitForTimeout(400);
+
+      await page.evaluate((): void => {
+        const btn = Array.from(document.querySelectorAll<HTMLElement>("button,input[type=submit]"))
+          .find(el => {
+            const t = (el.textContent || "").toLowerCase().trim();
+            const v = ((el as HTMLInputElement).value || "").toLowerCase();
+            return t === "sign in" || t === "login" || v === "login" || v === "sign in";
+          });
+        if (btn) btn.click();
+      });
+      await page.waitForTimeout(5000);
+    }
+
+    // ── Navigate to memberships ────────────────────────────────────────
+    console.log("[2] Navigate to /memberships");
     await page.goto("https://misterquik.sera.tech/memberships");
     await page.waitForTimeout(3000);
 
     const rows = await waitForRows(page, 15000);
+    if (rows.length === 0) {
+      return { success: true, message: "No memberships found", processedCount: 0, failedCount: 0, processed: [], failed: [], elapsedMinutes: 0, sessionUrl };
+    }
+
+    console.log("[3] Found " + rows.length + " memberships to process");
 
     for (const r of rows) {
       try {
