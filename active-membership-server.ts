@@ -117,21 +117,11 @@ async function openMembershipModal(
   soldOn: string,
   program: string
 ): Promise<string> {
-  // Strategy 1: stagehand.act() — most reliable, AI sees the actual rendered page
-  try {
-    await stagehand.act(
-      "In the memberships table, find the row for customer \"" + customer + "\" " +
-      "with sold date " + soldOn + " and click the program name \"" + program + "\" to open the Edit Memberships modal"
-    );
-    return "act()";
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message.split("\n")[0].substring(0, 100) : String(e);
-    console.log("  act() failed: " + msg);
-  }
-
-  // Strategy 2: stamp td[4] and use locator.click()
-  const stampResult: { id: string; trId: string; debug: string } = await page.evaluate(
-    function(args: { customer: string; soldOn: string; stamp: string }): { id: string; trId: string; debug: string } {
+  // The program text is inside <span class="link"> inside td[4].
+  // Stamp that span with a unique ID, then use locator.click() which fires
+  // real CDP pointer events — exactly what Angular's (click) handler needs.
+  const spanId: string = await page.evaluate(
+    function(args: { customer: string; soldOn: string; stamp: string }): string {
       const rows = Array.from(document.querySelectorAll("table tbody tr"));
       for (let i = 0; i < rows.length; i++) {
         const r = rows[i] as HTMLElement;
@@ -141,36 +131,34 @@ async function openMembershipModal(
         const rowCustomer = (cells[3] ? cells[3].textContent || "" : "").trim();
         if (rowSoldOn === args.soldOn && rowCustomer === args.customer) {
           const td = cells[4] as HTMLElement | undefined;
-          if (!td) return { id: "", trId: "", debug: "td[4] missing" };
+          if (!td) return "";
+          // Target the <span class="link"> specifically
+          const span = td.querySelector<HTMLElement>("span.link");
+          if (span) { span.id = args.stamp; return args.stamp; }
+          // Fallback: any span inside td[4]
+          const anySpan = td.querySelector<HTMLElement>("span");
+          if (anySpan) { anySpan.id = args.stamp; return args.stamp; }
+          // Fallback: stamp the td itself
           td.id = args.stamp;
-          r.id  = args.stamp + "_tr";
-          return { id: args.stamp, trId: args.stamp + "_tr", debug: "row " + i };
+          return args.stamp;
         }
       }
-      return { id: "", trId: "", debug: "not found in " + rows.length + " rows" };
+      return "";
     },
-    { customer, soldOn, stamp: "__click_" + Date.now() }
+    { customer, soldOn, stamp: "__sp_" + Date.now() }
   );
 
-  if (!stampResult.id) return "NOT FOUND: " + stampResult.debug;
+  if (!spanId) return "NOT FOUND: no matching row for " + customer;
 
-  // Try clicking td[4] via locator
+  // locator.click() resolves the element and fires real mousedown/mouseup CDP events
   try {
-    await page.locator("#" + stampResult.id).first().click();
-    return "locator td[4]";
+    await page.locator("#" + spanId).first().click();
+    return "locator span.link click";
   } catch (e: unknown) {
-    console.log("  locator td[4] failed");
+    console.log("  locator span click failed: " + (e instanceof Error ? e.message.split("\n")[0].substring(0, 60) : String(e)));
   }
 
-  // Try clicking the tr via locator
-  try {
-    await page.locator("#" + stampResult.trId).first().click();
-    return "locator tr";
-  } catch (e: unknown) {
-    console.log("  locator tr failed");
-  }
-
-  // Strategy 3: CDP coordinates on td[4]
+  // Fallback: CDP mouse coordinates on the span
   const coords: { x: number; y: number; ok: boolean } = await page.evaluate(
     function(id: string): { x: number; y: number; ok: boolean } {
       const el = document.getElementById(id);
@@ -179,7 +167,7 @@ async function openMembershipModal(
       const r = el.getBoundingClientRect();
       return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), ok: r.width > 0 };
     },
-    stampResult.id
+    spanId
   );
 
   if (coords.ok) {
@@ -188,7 +176,7 @@ async function openMembershipModal(
     await page.sendCDP("Input.dispatchMouseEvent", { type: "mousePressed",  x, y, button: "left", clickCount: 1, modifiers: 0 });
     await page.waitForTimeout(80);
     await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1, modifiers: 0 });
-    return "CDP (" + x + "," + y + ")";
+    return "CDP span at (" + x + "," + y + ")";
   }
 
   return "ALL FAILED";
