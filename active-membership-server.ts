@@ -105,57 +105,81 @@ async function waitForRows(page: SPage, ms = 10000): Promise<MembershipRow[]> {
 }
 
 /**
- * Use a REAL CDP mouse click on the program cell (td[4]) to open the modal.
- * IMPORTANT: Rows shift after each processed entry disappears from the table.
- * We ALWAYS find the row fresh by customer name — never use stored rowIndex.
+ * Click the program cell to open the Edit Memberships modal.
+ * Finds the row fresh each time by soldOn+customer (rows shift as items are processed).
+ * Tries multiple strategies:
+ *   1. Stamp the td[4] element with a unique ID, use locator.click() (Stagehand pierce)
+ *   2. CDP mouse click on td[4] center coordinates
+ *   3. CDP mouse click on the <tr> row itself
  */
 async function clickProgramCellByCustomer(page: SPage, customer: string, soldOn: string): Promise<string> {
-  const coords: { x: number; y: number; found: boolean; debug: string } = await page.evaluate(
-    function(args: { customer: string; soldOn: string }): { x: number; y: number; found: boolean; debug: string } {
+  // Stamp a unique ID on the target td[4] so we can use locator.click()
+  const stampResult: { id: string; trId: string; debug: string } = await page.evaluate(
+    function(args: { customer: string; soldOn: string; stamp: string }): { id: string; trId: string; debug: string } {
       const rows = Array.from(document.querySelectorAll("table tbody tr"));
-      let targetRow: Element | null = null;
-
       for (let i = 0; i < rows.length; i++) {
-        const r = rows[i];
+        const r = rows[i] as HTMLElement;
         if (!r) continue;
         const cells = r.querySelectorAll("td");
         const rowSoldOn   = (cells[0] ? cells[0].textContent || "" : "").trim();
         const rowCustomer = (cells[3] ? cells[3].textContent || "" : "").trim();
         if (rowSoldOn === args.soldOn && rowCustomer === args.customer) {
-          targetRow = r;
-          break;
+          const td = cells[4] as HTMLElement | undefined;
+          if (!td) return { id: "", trId: "", debug: "td[4] missing" };
+          td.id = args.stamp;
+          r.id  = args.stamp + "_tr";
+          return {
+            id: args.stamp,
+            trId: args.stamp + "_tr",
+            debug: "row " + i + " td[4]=" + (td.textContent || "").trim().substring(0, 30),
+          };
         }
       }
-
-      if (!targetRow) {
-        return { x: 0, y: 0, found: false, debug: "customer not found: " + args.customer + " | rows=" + rows.length };
-      }
-
-      const cells = targetRow.querySelectorAll("td");
-      const cell = cells[4] as HTMLElement | undefined;
-      if (!cell) return { x: 0, y: 0, found: false, debug: "td[4] missing, cells=" + cells.length };
-
-      cell.scrollIntoView({ block: "center", inline: "center" });
-      const r = cell.getBoundingClientRect();
-      return {
-        x: Math.round(r.left + r.width / 2),
-        y: Math.round(r.top  + r.height / 2),
-        found: r.width > 0,
-        debug: "td[4] text=" + (cell.textContent || "").trim().substring(0, 30) + " rect=" + Math.round(r.left) + "," + Math.round(r.top) + " " + Math.round(r.width) + "x" + Math.round(r.height),
-      };
+      return { id: "", trId: "", debug: "not found in " + rows.length + " rows" };
     },
-    { customer, soldOn }
+    { customer, soldOn, stamp: "__click_" + Date.now() }
   );
 
-  if (!coords.found) return "NOT FOUND: " + coords.debug;
+  if (!stampResult.id) return "NOT FOUND: " + stampResult.debug;
 
-  const { x, y } = coords;
-  await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseMoved",    x, y, button: "none" });
-  await page.sendCDP("Input.dispatchMouseEvent", { type: "mousePressed",  x, y, button: "left", clickCount: 1, modifiers: 0 });
-  await page.waitForTimeout(80);
-  await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1, modifiers: 0 });
+  // Strategy 1: locator.click() on the stamped td — Stagehand resolves and fires real events
+  try {
+    await page.locator("#" + stampResult.id).first().click();
+    return "locator.click() on td[4] | " + stampResult.debug;
+  } catch (e: unknown) {
+    console.log("  locator.click() td failed: " + (e instanceof Error ? e.message.split("\n")[0].substring(0, 60) : String(e)));
+  }
 
-  return "CDP click at (" + x + "," + y + ") | " + coords.debug;
+  // Strategy 2: locator.click() on the <tr> row
+  try {
+    await page.locator("#" + stampResult.trId).first().click();
+    return "locator.click() on tr | " + stampResult.debug;
+  } catch (e: unknown) {
+    console.log("  locator.click() tr failed: " + (e instanceof Error ? e.message.split("\n")[0].substring(0, 60) : String(e)));
+  }
+
+  // Strategy 3: CDP mouse click on td[4] center
+  const coords: { x: number; y: number; ok: boolean } = await page.evaluate(
+    function(id: string): { x: number; y: number; ok: boolean } {
+      const el = document.getElementById(id);
+      if (!el) return { x: 0, y: 0, ok: false };
+      el.scrollIntoView({ block: "center" });
+      const r = el.getBoundingClientRect();
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2), ok: r.width > 0 };
+    },
+    stampResult.id
+  );
+
+  if (coords.ok) {
+    const { x, y } = coords;
+    await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseMoved",    x, y, button: "none" });
+    await page.sendCDP("Input.dispatchMouseEvent", { type: "mousePressed",  x, y, button: "left", clickCount: 1, modifiers: 0 });
+    await page.waitForTimeout(80);
+    await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1, modifiers: 0 });
+    return "CDP click at (" + x + "," + y + ") | " + stampResult.debug;
+  }
+
+  return "ALL STRATEGIES FAILED: " + stampResult.debug;
 }
 
 async function waitForModal(page: SPage, ms = 8000): Promise<boolean> {
