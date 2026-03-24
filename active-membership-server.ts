@@ -150,19 +150,20 @@ async function clickProgramLink(
 
       const cells = Array.from(targetRow.querySelectorAll("td"));
 
-      // The PROGRAM column is td[4] — click its <a> link
+      // The PROGRAM column is td[4].
+      // The program text is NOT a plain <a> tag — it is rendered by an Angular/web component.
+      // The click handler is on the <td> element itself (or a child span/div).
       const programCell = cells[4];
       if (programCell) {
-        const link = programCell.querySelector<HTMLAnchorElement>("a");
-        if (link) {
-          link.click();
-          return { clicked: true, detail: "td[4] link: " + (link.textContent || "").trim() + " href=" + (link.getAttribute("href") || "") };
+        // Try clicking a child element first (span, div, or any non-<a> clickable)
+        const child = programCell.querySelector<HTMLElement>("span,div,[class],[role=button]");
+        if (child) {
+          child.click();
+          return { clicked: true, detail: "td[4] child click: " + child.tagName + " text=" + (child.textContent || "").trim().substring(0, 30) };
         }
-        // Program cell exists but no <a> — log all links in row
-        const allLinks = Array.from(targetRow.querySelectorAll("a")).map(function(a) {
-          return "td-href=" + (a.getAttribute("href") || "none") + " text=" + (a.textContent || "").trim().substring(0, 20);
-        });
-        return { clicked: false, detail: "no link in td[4]. Row links: " + allLinks.join(" | ") };
+        // Click the <td> cell directly
+        (programCell as HTMLElement).click();
+        return { clicked: true, detail: "td[4] direct click: text=" + (programCell.textContent || "").trim().substring(0, 30) };
       }
 
       return { clicked: false, detail: "td[4] not found. cells=" + cells.length };
