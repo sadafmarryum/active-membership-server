@@ -279,11 +279,12 @@ async function clickSaveComplete(page: SPage): Promise<void> {
         return {
           x: Math.round(rect.left + rect.width / 2),
           y: Math.round(rect.top + rect.height / 2),
-          found: true
+          found: true,
+          debug: "Fallback: placeholder match"
         };
       }
     }
-    return { x: 0, y: 0, found: false };
+    return { x: 0, y: 0, found: false, debug: "Fallback failed" };
   });
 
   if (!coords.found) throw new Error("Save button not found");
