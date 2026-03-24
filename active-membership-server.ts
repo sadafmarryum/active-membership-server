@@ -106,34 +106,34 @@ async function waitForRows(page: SPage, ms = 10000): Promise<MembershipRow[]> {
 
 /**
  * Use a REAL CDP mouse click on the program cell (td[4]) to open the modal.
- * JS .click() doesn't work because Angular's event listeners require real pointer events.
- * getBoundingClientRect() gives viewport coordinates that work even inside components.
+ * IMPORTANT: Rows shift after each processed entry disappears from the table.
+ * We ALWAYS find the row fresh by customer name — never use stored rowIndex.
  */
-async function clickProgramCellByIndex(page: SPage, rowIndex: number, program: string): Promise<string> {
-  // Get the viewport coordinates of td[4] in the target row
+async function clickProgramCellByCustomer(page: SPage, customer: string, soldOn: string): Promise<string> {
   const coords: { x: number; y: number; found: boolean; debug: string } = await page.evaluate(
-    function(args: { rowIndex: number; program: string }): { x: number; y: number; found: boolean; debug: string } {
+    function(args: { customer: string; soldOn: string }): { x: number; y: number; found: boolean; debug: string } {
       const rows = Array.from(document.querySelectorAll("table tbody tr"));
-      // Find the row with matching program text at the expected index
       let targetRow: Element | null = null;
+
       for (let i = 0; i < rows.length; i++) {
         const r = rows[i];
         if (!r) continue;
         const cells = r.querySelectorAll("td");
-        const programText = (cells[4] ? cells[4].textContent || "" : "").trim();
-        if (programText === args.program) {
-          // If multiple rows have the same program, pick the one at rowIndex or first match
-          if (!targetRow || i === args.rowIndex) targetRow = r;
-          if (i === args.rowIndex) break;
+        const rowSoldOn   = (cells[0] ? cells[0].textContent || "" : "").trim();
+        const rowCustomer = (cells[3] ? cells[3].textContent || "" : "").trim();
+        if (rowSoldOn === args.soldOn && rowCustomer === args.customer) {
+          targetRow = r;
+          break;
         }
       }
-      // Final fallback: use rowIndex directly
-      if (!targetRow) targetRow = rows[args.rowIndex] || null;
-      if (!targetRow) return { x: 0, y: 0, found: false, debug: "row not found, total rows=" + rows.length };
+
+      if (!targetRow) {
+        return { x: 0, y: 0, found: false, debug: "customer not found: " + args.customer + " | rows=" + rows.length };
+      }
 
       const cells = targetRow.querySelectorAll("td");
       const cell = cells[4] as HTMLElement | undefined;
-      if (!cell) return { x: 0, y: 0, found: false, debug: "td[4] not found, cells=" + cells.length };
+      if (!cell) return { x: 0, y: 0, found: false, debug: "td[4] missing, cells=" + cells.length };
 
       cell.scrollIntoView({ block: "center", inline: "center" });
       const r = cell.getBoundingClientRect();
@@ -144,13 +144,12 @@ async function clickProgramCellByIndex(page: SPage, rowIndex: number, program: s
         debug: "td[4] text=" + (cell.textContent || "").trim().substring(0, 30) + " rect=" + Math.round(r.left) + "," + Math.round(r.top) + " " + Math.round(r.width) + "x" + Math.round(r.height),
       };
     },
-    { rowIndex, program }
+    { customer, soldOn }
   );
 
   if (!coords.found) return "NOT FOUND: " + coords.debug;
 
   const { x, y } = coords;
-  // Fire real pointer events — required for Angular click handlers
   await page.sendCDP("Input.dispatchMouseEvent", { type: "mouseMoved",    x, y, button: "none" });
   await page.sendCDP("Input.dispatchMouseEvent", { type: "mousePressed",  x, y, button: "left", clickCount: 1, modifiers: 0 });
   await page.waitForTimeout(80);
@@ -417,7 +416,7 @@ async function runMembershipTask(): Promise<TaskResult> {
 
       // ── 3a. Click the program cell with a real CDP mouse event ─────
       console.log("  Clicking program cell...");
-      const clickResult = await clickProgramCellByIndex(page, row.rowIndex, row.program);
+      const clickResult = await clickProgramCellByCustomer(page, row.customer, row.soldOn);
       console.log("  Click: " + clickResult);
 
       // ── 3b. Wait for modal to appear ───────────────────────────────
