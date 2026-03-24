@@ -18,6 +18,7 @@ type ModalVariant = "ends-on" | "next-billing" | "unknown";
 interface MembershipRow {
   soldOn: string; invoice: string; job: string;
   customer: string; program: string; rowIndex: number;
+  linkHref: string; // href of the <a> that opens the modal
 }
 interface ProcessedEntry {
   customer: string; job: string; program: string;
@@ -66,12 +67,25 @@ async function waitForRows(page: SPage, ms = 10000): Promise<MembershipRow[]> {
         if (c.length < 5) return;
         const soldOn = c[0]?.textContent?.trim() ?? "";
         if (!soldOn.match(/\d{2}\/\d{2}\/\d{4}/)) return;
+        // Capture the href from whichever cell contains the program link
+        // (typically cells[4] which is the program name column)
+        const programCell = c[4];
+        const programLink = programCell?.querySelector("a");
+        // Also check all cells for any link that opens a modal (has data attrs or specific href)
+        let linkHref = programLink?.getAttribute("href") ?? "";
+        // If no link in program cell, check invoice/job cells
+        if (!linkHref) {
+          for (let ci = 0; ci < c.length; ci++) {
+            const a = c[ci]?.querySelector("a");
+            if (a) { linkHref = a.getAttribute("href") ?? ""; if (linkHref) break; }
+          }
+        }
         out.push({
           soldOn, invoice: c[1]?.textContent?.trim() ?? "",
           job: c[2]?.textContent?.trim() ?? "",
           customer: c[3]?.textContent?.trim() ?? "",
           program: c[4]?.textContent?.trim() ?? "",
-          rowIndex: i,
+          rowIndex: i, linkHref,
         });
       });
       return out;
@@ -392,34 +406,56 @@ async function runMembershipTask(): Promise<TaskResult> {
         failed.push({ ...row, message: "Table empty after reload" }); continue;
       }
 
-      // Click the link that opens the Edit Memberships modal for this row.
-      // The clickable link may be on the invoice/job number cell, not the program name.
-      // We find the correct table row by matching soldOn + customer, then click its first <a>.
-      const linkClicked: boolean = await page.evaluate(
-        (args: { soldOn: string; customer: string; program: string; rowIndex: number }): boolean => {
-          const allRows = Array.from(document.querySelectorAll("table tbody tr"));
+      // Open the Edit Memberships modal for this row.
+      // Strategy 1: stagehand.act() — AI finds and clicks the program name link
+      let linkClicked = false;
+      try {
+        await stagehand.act(
+          `Click the program link "${row.program}" for customer "${row.customer}" ` +
+          `in the memberships table to open the Edit Memberships modal`
+        );
+        linkClicked = true;
+        console.log("  ℹ️  Modal opened via stagehand.act()");
+      } catch (e: unknown) {
+        console.log(`  ⚠️  act() failed: ${e instanceof Error ? e.message.split("\n")[0] : e}`);
+      }
 
-          // Find row by matching soldOn + customer + program prefix
-          const matchRow = allRows.find(r => {
-            const texts = Array.from(r.querySelectorAll("td")).map(c => c.textContent?.trim() ?? "");
-            return texts.some(t => t === args.soldOn)
-                && texts.some(t => t === args.customer)
-                && texts.some(t => t.startsWith(args.program.substring(0, 10)));
-          }) ?? allRows[args.rowIndex]; // fallback: use stored rowIndex
+      // Strategy 2: if act() failed or returned empty elementId, click by row position
+      if (!linkClicked) {
+        linkClicked = await page.evaluate(
+          (args: { soldOn: string; customer: string; program: string; rowIndex: number; linkHref: string }): boolean => {
+            const allRows = Array.from(document.querySelectorAll("table tbody tr"));
 
-          if (!matchRow) return false;
+            // Find the matching row
+            const matchRow = allRows.find(r => {
+              const texts = Array.from(r.querySelectorAll("td")).map(c => c.textContent?.trim() ?? "");
+              return texts.some(t => t === args.soldOn)
+                  && texts.some(t => t === args.customer);
+            }) ?? allRows[args.rowIndex];
 
-          // Click the first visible <a> in the row
-          const link = Array.from(matchRow.querySelectorAll<HTMLAnchorElement>("a"))
-            .find(a => (a as HTMLElement).offsetParent !== null);
-          if (link) { link.click(); return true; }
+            if (!matchRow) return false;
 
-          // No <a> found — try clicking the row itself (tr onclick handler)
-          (matchRow as HTMLElement).click();
-          return true;
-        },
-        { soldOn: row.soldOn, customer: row.customer, program: row.program, rowIndex: row.rowIndex }
-      );
+            // Try every <a> in the row — click each until one triggers a modal
+            // The program cell link is usually the last or specific column
+            const links = Array.from(matchRow.querySelectorAll<HTMLAnchorElement>("a"))
+              .filter(a => (a as HTMLElement).offsetParent !== null);
+
+            // Prefer links that look like modal triggers (no full URL, or href="#" or data attrs)
+            const modalLink = links.find(a => {
+              const href = a.getAttribute("href") ?? "";
+              return href === "#" || href === "" || href.startsWith("javascript") || a.hasAttribute("data-");
+            }) ?? links[links.length - 1] ?? links[0]; // last link is often the program name
+
+            if (modalLink) { modalLink.click(); return true; }
+
+            // No links — click the row itself
+            (matchRow as HTMLElement).click();
+            return true;
+          },
+          { soldOn: row.soldOn, customer: row.customer, program: row.program,
+            rowIndex: row.rowIndex, linkHref: row.linkHref }
+        );
+      }
 
       if (!linkClicked) {
         failed.push({ ...row, message: "Program link not found" }); continue;
